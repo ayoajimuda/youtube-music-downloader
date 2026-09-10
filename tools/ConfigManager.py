@@ -51,25 +51,11 @@ class DownloaderConfigManager:
 
     # ==================== Named profiles ====================
     @classmethod
-    def spotify_defaults(cls) -> Dict[str, Any]:
-        return {
-            **cls._COMMON_DEFAULTS,
-            "output_directory": str(Path.home() / "Music" / "Collection" / "Spotify"),
-            "max_downloads_per_minute": 60,
-            "max_metadata_calls_per_minute": 30,
-        }
-
-    @classmethod
     def youtube_defaults(cls) -> Dict[str, Any]:
         return {
             **cls._COMMON_DEFAULTS,
             "output_directory": str(Path.home() / "Music" / "Collection" / "YouTube"),
         }
-
-    @classmethod
-    def for_spotify(cls, config_file: str = "config/SpotifyMusicDownloader.json",
-                    on_error: Optional[Callable[[str], None]] = None):
-        return cls(config_file, cls.spotify_defaults(), on_error)
 
     @classmethod
     def for_youtube(cls, config_file: str = "config/YoutubeMusicDownloader.json",

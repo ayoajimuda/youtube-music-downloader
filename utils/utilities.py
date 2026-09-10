@@ -69,119 +69,6 @@ class DownloaderUtils:
             return False
 
     @staticmethod
-    def check_spotdl() -> bool:
-        """ Checks if spotdl is installed on user's device"""
-        print(f"\n {Fore.CYAN} Checking for spotdl...")
-        
-        if shutil.which("spotdl"):
-            print(f"{Fore.GREEN}✓{Style.RESET_ALL} spotdl is installed")
-            try:
-                result = subprocess.run(
-                    ["spotdl", "--version"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=True,
-                    timeout=10
-                )
-                if result.returncode == 0:
-                    version = result.stdout.strip()
-                    print(f"  Version: {Fore.YELLOW}{version}{Style.RESET_ALL}")
-                    return True
-            except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.CalledProcessError):
-                print(f"{Fore.YELLOW}⚠{Style.RESET_ALL} Could not determine spotdl version")
-                return True
-        else:
-            print(f"{Fore.RED}✗{Style.RESET_ALL} spotdl is not installed")
-            return False
-
-    @staticmethod
-    def show_ytdlp_help():
-        """Display yt-dlp help"""
-        try:
-            # First check if yt-dlp is installed
-            if not DownloaderUtils.check_ytdlp():
-                print(f"{Fore.RED}yt-dlp is not installed. Please install it first.{Style.RESET_ALL}")
-                input("\nPress Enter to continue...")
-                return False
-                
-            result = subprocess.run(
-                ["yt-dlp", "--help"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True,
-                timeout=30
-            )
-            print("\n" + "=" * 50)
-            # Check if Enhanced_Menu is available
-            try:
-                Enhanced_Menu.print_header("YT-DLP HELP")
-            except:
-                print(f"{Fore.CYAN}YT-DLP HELP{Style.RESET_ALL}")
-            print("=" * 50)
-            print(result.stdout[:1000])
-            print("\n... (output truncated, use 'yt-dlp --help' for full help)")
-        except subprocess.CalledProcessError as e:
-            try:
-                Enhanced_Menu.print_status(f"Could not get yt-dlp help: {e}", "error")
-            except:
-                print(f"{Fore.RED}Could not get yt-dlp help: {e}{Style.RESET_ALL}")
-            return False
-        except FileNotFoundError:
-            print(f"{Fore.RED}yt-dlp not found. Please install it first.{Style.RESET_ALL}")
-            return False
-        except Exception as e:
-            print(f"{Fore.RED}Unexpected error: {e}{Style.RESET_ALL}")
-            return False
-            
-        input("\nPress Enter to continue...")
-        return True
-    
-    @staticmethod
-    def show_spotdl_help():
-        """Display spotdl help menu"""
-        try:
-            # First check if yt-dlp is installed
-            if not DownloaderUtils.check_spotdl():
-                print(f"{Fore.RED}spotdl is not installed. Please install it first.{Style.RESET_ALL}")
-                input("\nPress Enter to continue...")
-                return False
-                
-            result = subprocess.run(
-                ["spotdl", "--help"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True,
-                timeout=30
-            )
-            print("\n" + "=" * 50)
-            # Check if Enhanced_Menu is available
-            try:
-                Enhanced_Menu.print_header("SPOTDL HELP")
-            except:
-                print(f"{Fore.CYAN}SPOTDL HELP{Style.RESET_ALL}")
-            print("=" * 50)
-            print(result.stdout[:1000])
-            print("\n... (output truncated, use 'spotdl --help' for full help)")
-        except subprocess.CalledProcessError as e:
-            try:
-                Enhanced_Menu.print_status(f"Could not get spotdl help: {e}", "error")
-            except:
-                print(f"{Fore.RED}Could not get spotdl help: {e}{Style.RESET_ALL}")
-            return False
-        except FileNotFoundError:
-            print(f"{Fore.RED}spotdl not found. Please install it first.{Style.RESET_ALL}")
-            return False
-        except Exception as e:
-            print(f"{Fore.RED}Unexpected error: {e}{Style.RESET_ALL}")
-            return False
-            
-        input("\nPress Enter to continue...")
-        return True       
-    
-    @staticmethod
     def check_dependencies():
         """Check for missing dependencies"""
         try:
@@ -198,7 +85,6 @@ class DownloaderUtils:
             ('colorama', 'colorama'),
             ('tqdm', 'tqdm'),
             ('yt_dlp', 'yt-dlp'),
-            ('spotdl', 'spotdl')
         ]
         
         for import_name, package_name in packages_to_check:
@@ -283,27 +169,6 @@ class DownloaderUtils:
         return fail_count == 0
 
     @staticmethod
-    def setup_spotdl():
-        print(f"{Fore.YELLOW} Installing Spotdl (Special)... {Style.RESET_ALL}")
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "git+https://github.com/TzurSoffer/spotify-downloader"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=60
-            )
-            if result.returncode == 0:
-                print(f"{Fore.GREEN}✓{Style.RESET_ALL} spotdl installed successfully")
-            else:
-                print(f"{Fore.RED}✗{Style.RESET_ALL} Failed to install spotdl")
-                print(f"  Error: {result.stderr[:100]}")
-        except subprocess.TimeoutExpired:
-                print(f"{Fore.RED}✗{Style.RESET_ALL} Installation timeout for spotdl")
-        except Exception as e:
-                print(f"{Fore.RED}✗{Style.RESET_ALL} Error installing spotdl: {e}")
-
-    @staticmethod
     def program_info():
         """Display program information"""
         print("=" * 80)
@@ -333,7 +198,6 @@ class DownloaderUtils:
             {Fore.CYAN}Requirements:{Style.RESET_ALL}
             • Python 3.7+
             • yt-dlp (For Youtube Music Downloader)
-            • spotdl (For Spotify Music Downloader)
             • FFmpeg (recommended for audio conversion)
             • Internet connection
             • Particular python libraries & dependencies

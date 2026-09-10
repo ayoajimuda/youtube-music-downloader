@@ -1,117 +1,475 @@
-import shutil
-import time
-from pathlib import Path
+"""Cookie handling for YoutubeMusicDownloader.
+
+The downloader needs one thing from a cookie file: YouTube account cookies in
+the Netscape format yt-dlp reads. There is a single active cookie file, and
+the choice is remembered between runs in cookies/active_cookie.json.
+
+Details that come from yt-dlp's own source and matter here:
+
+- yt-dlp refuses a cookie file unless its first line matches
+  "# Netscape HTTP Cookie File" exactly, capitalisation included.
+- It treats an account as signed in only when LOGIN_INFO is present together
+  with one of the SAPISID cookies. YouTube clears LOGIN_INFO when it rotates
+  cookies, so a file can look complete and still be signed out.
+- It rewrites its --cookies file in place when it exits. Two concurrent yt-dlp
+  processes sharing one file can therefore truncate it under each other, so
+  every download gets its own copy (begin_run / end_run).
+- It cannot sign in to YouTube with a username and password; cookies are the
+  only way to authenticate.
+"""
+
+import ctypes
+import json
 import os
 import platform
-import ctypes
+import re
+import shutil
 import subprocess
-from typing import List, Optional, Dict, Any
-import browser_cookie3
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
 from colorama import init, Fore, Style
-import requests  # moved import to top
-import json
+
+try:
+    import browser_cookie3
+except ImportError:          # extraction is optional; file-based cookies still work
+    browser_cookie3 = None
+
+from .EnhancedMenu import Enhanced_Menu
+
+try:
+    from .RateLimiter import youtube_limiter
+except Exception:
+    youtube_limiter = None
 
 init(autoreset=True)
 
-from .EnhancedMenu import Enhanced_Menu  # assumed existing
+COOKIE_DIRECTORY = "cookies"
+ACTIVE_STATE_FILE = "active_cookie.json"
+RUNS_DIRECTORY = ".runs"            # per-download copies, inside the cookie folder
+STALE_RUN_SECONDS = 24 * 3600
 
-COOKIE_DIRECTORY = r"cookies"
-os.makedirs(COOKIE_DIRECTORY, exist_ok=True)
+NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
+NETSCAPE_MAGIC = re.compile(r"#( Netscape)? HTTP Cookie File")
+HTTPONLY_PREFIX = "#HttpOnly_"
+LOGIN_COOKIE = "LOGIN_INFO"
+SAPISID_COOKIES = ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID")
+LOGIN_COOKIES = (LOGIN_COOKIE,) + SAPISID_COOKIES
+
+COOKIE_HOWTO_URL = "https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+LOCALLY_EXTENSION_URL = ("https://chromewebstore.google.com/detail/get-cookiestxt-locally/"
+                         "cclelndahbckbenkjhflpdbgdldlbecc")
+
+# The liked-videos feed. yt-dlp won't open it without a signed-in session, so
+# it shows whether YouTube still accepts the cookies without downloading anything.
+VERIFY_TARGET = ":ytfav"
+
+BROWSERS = ("firefox", "chrome", "edge", "brave", "opera", "opera_gx", "chromium", "safari")
+CHROMIUM_BROWSERS = {"chrome", "edge", "brave", "opera", "opera_gx", "chromium"}
+
+
+# ==================== File helpers ====================
+def _is_youtube_domain(domain: str) -> bool:
+    d = domain.lstrip(".").lower()
+    return d == "youtube.com" or d.endswith(".youtube.com")
+
+
+def _write_private(path: Path, data) -> None:
+    """
+    Atomic write with owner-only permissions on POSIX.
+
+    mkstemp creates the temp file as 0600, and os.replace keeps that mode, so
+    the cookie file is never briefly readable by other users.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+@dataclass
+class CookieReport:
+    """What a cookie file holds, judged the way yt-dlp will judge it."""
+    path: Path
+    readable: bool = False
+    header_ok: bool = False
+    json_format: bool = False
+    entries: int = 0
+    youtube_entries: int = 0
+    bad_lines: int = 0
+    signed_in: bool = False
+    login_expired: bool = False
+    login_expires: Optional[float] = None    # earliest expiry of the login cookies; None = session
+    error: str = ""
+
+    @property
+    def repairable(self) -> bool:
+        """Valid entries, but a header yt-dlp won't accept."""
+        return self.readable and not self.json_format and not self.header_ok and self.entries > 0
+
+    @property
+    def usable(self) -> bool:
+        return self.readable and self.header_ok and self.signed_in
+
+    def summary(self) -> str:
+        if not self.readable:
+            return f"unreadable ({self.error})"
+        if self.json_format:
+            return "JSON export - yt-dlp needs the Netscape (cookies.txt) format"
+        if not self.entries:
+            return "no cookies in file"
+        parts = [f"{self.youtube_entries} YouTube cookie(s)"]
+        if not self.header_ok:
+            parts.append("header yt-dlp rejects (repairable)")
+        if self.signed_in:
+            when = (time.strftime("%Y-%m-%d", time.localtime(self.login_expires))
+                    if self.login_expires else "end of session")
+            parts.append(f"signed in (login cookies last until {when})")
+        elif self.login_expired:
+            parts.append("login cookies have expired")
+        else:
+            parts.append("not signed in")
+        return ", ".join(parts)
+
+
+def inspect_cookie_file(path) -> CookieReport:
+    """Read a cookie file with the same rules yt-dlp's loader applies."""
+    report = CookieReport(Path(path))
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as e:
+        report.error = str(e)
+        return report
+    report.readable = True
+
+    stripped = text.lstrip()
+    if stripped and stripped[0] in "[{":
+        report.json_format = True
+        return report
+
+    lines = text.splitlines()
+    report.header_ok = bool(lines) and bool(NETSCAPE_MAGIC.search(lines[0]))
+
+    now = time.time()
+    live_names = set()
+    login_expiries: List[float] = []
+    saw_expired_login = False
+
+    for line in lines:
+        if line.startswith(HTTPONLY_PREFIX):
+            line = line[len(HTTPONLY_PREFIX):]
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7 or (fields[4] and not re.fullmatch(r"\d+(?:\.\d+)?", fields[4])):
+            report.bad_lines += 1
+            continue
+        domain, _, _, _, expires, name, _ = fields
+        report.entries += 1
+        if not _is_youtube_domain(domain):
+            continue
+        report.youtube_entries += 1
+
+        expiry = float(expires) if expires else 0.0
+        if expiry and expiry < now:
+            # yt-dlp won't send an expired cookie, so it doesn't count.
+            saw_expired_login = saw_expired_login or name in LOGIN_COOKIES
+            continue
+        live_names.add(name)
+        if name in LOGIN_COOKIES and expiry:
+            login_expiries.append(expiry)
+
+    report.signed_in = LOGIN_COOKIE in live_names and any(n in live_names for n in SAPISID_COOKIES)
+    report.login_expired = saw_expired_login and not report.signed_in
+    if report.signed_in and login_expiries:
+        report.login_expires = min(login_expiries)
+    return report
+
 
 class CookieManager:
     """Manages cookies for authentication"""
-    def __init__(self, config_path: Optional[Path] = None):
+
+    def __init__(self):
         self.cookie_directory = Path(COOKIE_DIRECTORY)
         self.cookie_directory.mkdir(exist_ok=True)
         self.current_cookie_file: Optional[Path] = None
-        self.config_path = Path("config/spotify_downloader.json")
-        self.use_auth = False
-        
-        # Load credentials from the config file
-        self._client_id = None
-        self._client_secret = None
-        self._auth_token = None
-        
-        self.cookie_sources: Dict[str, Any] = {
-            'chrome': browser_cookie3.chrome,
-            'firefox': browser_cookie3.firefox,
-            'edge': browser_cookie3.edge,
-            'opera': browser_cookie3.opera,
-            'opera_gx': browser_cookie3.opera_gx,
-            'brave': browser_cookie3.brave,
-            'safari': browser_cookie3.safari,
-            'chromium': browser_cookie3.chromium
-        }
 
-        # For Linux fallback (not used yet, but kept for future expansion)
-        self.linux_cookie_paths = {
-            'chrome': '~/.config/google-chrome/Default/Cookies',
-            'chromium': '~/.config/chromium/Default/Cookies',
-            'firefox': '~/.mozilla/firefox/*.default-release/cookies.sqlite'
-        }
+        # Guards the active file: the downloader reads and writes it from
+        # several worker threads at once.
+        self._lock = threading.RLock()
+        self._report_cache: Dict[str, Tuple[Tuple[int, int], CookieReport]] = {}
+
+        self.cookie_sources: Dict[str, Callable] = {}
+        if browser_cookie3 is not None:
+            for name in BROWSERS:
+                func = getattr(browser_cookie3, name, None)
+                if func is not None:
+                    self.cookie_sources[name] = func
 
         self.is_admin = self._check_admin()
-        self._load_credentials()
-        
-    def _load_credentials(self):
-        """Load Spotify credentials from the main config file."""
-        if not self.config_path.exists():
+        self._restore_active()
+        self._clean_stale_runs()
+
+    # ==================== Active cookie file ====================
+    def _state_path(self) -> Path:
+        return self.cookie_directory / ACTIVE_STATE_FILE
+
+    def _restore_active(self) -> None:
+        try:
+            data = json.loads(self._state_path().read_text(encoding="utf-8"))
+            path = Path(data.get("path", ""))
+            if data.get("path") and path.is_file():
+                self.current_cookie_file = path
+        except (OSError, ValueError):
+            pass
+
+    def set_active(self, path: Optional[Path]) -> None:
+        """Make `path` the cookie file every download uses, and remember it."""
+        with self._lock:
+            self.current_cookie_file = Path(path).resolve() if path else None
+            try:
+                if self.current_cookie_file:
+                    _write_private(self._state_path(),
+                                   json.dumps({"path": str(self.current_cookie_file)}, indent=2))
+                elif self._state_path().exists():
+                    self._state_path().unlink()
+            except OSError as e:
+                Enhanced_Menu.print_status(f"Could not remember the active cookie file: {e}", "warning")
+
+    def get_active_cookie_file(self) -> Optional[Path]:
+        path = self.current_cookie_file
+        return path if path and path.is_file() else None
+
+    def report(self, path: Path) -> CookieReport:
+        """inspect_cookie_file, cached until the file changes."""
+        path = Path(path)
+        try:
+            st = path.stat()
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return inspect_cookie_file(path)
+        cached = self._report_cache.get(str(path))
+        if cached and cached[0] == key:
+            return cached[1]
+        result = inspect_cookie_file(path)
+        self._report_cache[str(path)] = (key, result)
+        return result
+
+    def _in_cookie_directory(self, path: Path) -> bool:
+        try:
+            return Path(path).resolve().parent == self.cookie_directory.resolve()
+        except OSError:
+            return False
+
+    def repair_cookie_file(self, path: Path, quiet: bool = False) -> Optional[Path]:
+        """
+        Give a file the header yt-dlp insists on.
+
+        A file inside the cookie folder is fixed in place. A file elsewhere
+        (say, in Downloads) is left alone and a fixed copy goes into the
+        cookie folder. Files written by the earlier version of this class had
+        "# Netscape HTTP cookie file" in lowercase, which yt-dlp rejects.
+        """
+        path = Path(path)
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            target = (path if self._in_cookie_directory(path)
+                      else self.cookie_directory / f"{path.stem}_fixed.txt")
+            _write_private(target, NETSCAPE_HEADER + "\n" + text)
+        except OSError as e:
+            if not quiet:
+                Enhanced_Menu.print_status(f"Could not repair {path.name}: {e}", "error")
+            return None
+        if not quiet:
+            where = "in place" if target == path else f"as {target}"
+            Enhanced_Menu.print_status(f"Repaired the cookie file header {where}", "success")
+        return target
+
+    def auto_select(self) -> Optional[Path]:
+        """With nothing active, adopt the newest signed-in file in the cookie folder."""
+        candidates = sorted(self.cookie_directory.glob("*.txt"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        for candidate in candidates:
+            rep = self.report(candidate)
+            if rep.repairable:
+                fixed = self.repair_cookie_file(candidate, quiet=True)
+                rep = self.report(fixed) if fixed else rep
+                candidate = fixed or candidate
+            if rep.usable:
+                self.set_active(candidate)
+                return self.current_cookie_file
+        return None
+
+    def prepare_for_ytdlp(self) -> Tuple[Optional[Path], Optional[CookieReport]]:
+        """
+        The cookie file to hand yt-dlp, and its report.
+
+        Returns (None, report) when the active file can't be used at all (JSON
+        export, unreadable), and (None, None) when there is no file.
+        """
+        with self._lock:
+            path = self.get_active_cookie_file() or self.auto_select()
+            if path is None:
+                return None, None
+            rep = self.report(path)
+            if rep.repairable:
+                fixed = self.repair_cookie_file(path, quiet=True)
+                if fixed:
+                    if fixed != path:
+                        self.set_active(fixed)
+                    path, rep = fixed, self.report(fixed)
+            if not rep.readable or rep.json_format or not rep.header_ok:
+                return None, rep
+            return path, rep
+
+    # ==================== Per-download copies ====================
+    def _runs_directory(self) -> Path:
+        runs = self.cookie_directory / RUNS_DIRECTORY
+        runs.mkdir(exist_ok=True)
+        return runs
+
+    def _clean_stale_runs(self) -> None:
+        """Remove copies left behind by a crash (they contain live session cookies)."""
+        runs = self.cookie_directory / RUNS_DIRECTORY
+        if not runs.is_dir():
             return
+        cutoff = time.time() - STALE_RUN_SECONDS
+        for leftover in runs.glob("*"):
+            try:
+                if leftover.stat().st_mtime < cutoff:
+                    leftover.unlink()
+            except OSError:
+                pass
+
+    def begin_run(self, cookie_file) -> Optional[Path]:
+        """
+        A private copy of the cookie file for one yt-dlp process.
+
+        yt-dlp rewrites its --cookies file in place on exit. With several
+        downloads running, one process can empty the shared file while another
+        is still reading it, and that download then fails with "does not look
+        like a Netscape format cookies file". Returns None if no copy could be
+        made; the caller should then pass the original file.
+        """
         try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            self._client_id = config.get("client_id")
-            self._client_secret = config.get("client_secret")
-            self._auth_token = config.get("auth_token")
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Failed to load credentials from config: {e}", "error")
-            
-    def set_credentials(self, client_id=None, client_secret=None, auth_token=None):
-        """Set Spotify credentials (used to sync from downloader)."""
-        self._client_id = client_id
-        self._client_secret = client_secret
-        self._auth_token = auth_token
-    
-    def save_credentials(self):
-        """Write current credentials back to the main config file."""
-        if not self.config_path.exists():
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="run_", suffix=".txt", dir=self._runs_directory())
+            with self._lock:
+                data = Path(cookie_file).read_bytes()
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            return Path(tmp)
+        except OSError:
+            return None
+
+    def end_run(self, run_copy, cookie_file) -> None:
+        """
+        Fold what yt-dlp saved back into the real file, then drop the copy.
+
+        yt-dlp stores refreshed cookies when it exits, which is how a cookie
+        file stays alive in normal use. The copy is only written back when it
+        is still a valid, signed-in file, so a run that YouTube signed out
+        can't overwrite good cookies.
+        """
+        run_copy, target = Path(run_copy), Path(cookie_file)
         try:
-            # Load existing config to preserve other keys
-            if self.config_path.exists():
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-            else:
-                config = {}
-            # Update only the Spotify keys
-            config["client_id"] = self._client_id
-            config["client_secret"] = self._client_secret
-            config["auth_token"] = self._auth_token
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2)
-            Enhanced_Menu.print_status("Spotify credentials saved to config.", "success")
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Failed to save credentials: {e}", "error")
-            
-    def clear_spotify_credentials(self):
-        """Remove Spotify credentials from config and instance."""
-        self._client_id = None
-        self._client_secret = None
-        self._auth_token = None
-        # Remove keys from config file
+            with self._lock:
+                data = run_copy.read_bytes()
+                try:
+                    unchanged = data == target.read_bytes()
+                except OSError:
+                    unchanged = False
+                if not unchanged:
+                    rep = inspect_cookie_file(run_copy)
+                    if rep.header_ok and rep.signed_in:
+                        _write_private(target, data)
+        except OSError:
+            pass
+        finally:
+            try:
+                run_copy.unlink()
+            except OSError:
+                pass
+
+    # ==================== yt-dlp ====================
+    def verify_with_ytdlp(self, cookie_file=None, timeout: int = 90) -> Tuple[str, str]:
+        """
+        Ask yt-dlp whether YouTube still accepts the cookies.
+
+        Returns (verdict, detail). verdict is one of:
+        "valid", "rotated", "signed_out", "bad_file", "no_file", "no_ytdlp", "error".
+        """
+        path = Path(cookie_file) if cookie_file else self.get_active_cookie_file()
+        if not path or not path.is_file():
+            return "no_file", "No active cookie file"
+
+        rep = self.report(path)
+        if rep.repairable:
+            fixed = self.repair_cookie_file(path, quiet=True)
+            if fixed:
+                path, rep = fixed, self.report(fixed)
+        if not rep.readable or rep.json_format or not rep.header_ok:
+            return "bad_file", rep.summary()
+        if not rep.signed_in:
+            # No point asking YouTube: yt-dlp won't even try to sign in.
+            return "signed_out", rep.summary()
+
+        if not shutil.which("yt-dlp"):
+            return "no_ytdlp", "yt-dlp not found in PATH"
+
+        if youtube_limiter is not None:
+            youtube_limiter.acquire()
+
+        run_copy = self.begin_run(path)
+        command = ["yt-dlp", "--cookies", str(run_copy or path), "--simulate",
+                   "--flat-playlist", "--playlist-items", "1", VERIFY_TARGET]
         try:
-            if self.config_path.exists():
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                config.pop("client_id", None)
-                config.pop("client_secret", None)
-                config.pop("auth_token", None)
-                with open(self.config_path, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=2)
-                Enhanced_Menu.print_status("Spotify credentials cleared from config.", "success")
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Failed to clear credentials: {e}", "error")
-                     
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return "error", f"yt-dlp did not answer within {timeout}s"
+        except OSError as e:
+            return "error", f"Could not run yt-dlp: {e}"
+        finally:
+            if run_copy:
+                self.end_run(run_copy, path)
+
+        output = f"{result.stdout}\n{result.stderr}"
+        low = output.lower()
+        if "cookies are no longer valid" in low:
+            return "rotated", ("YouTube has rotated these cookies, so they no longer sign you in. "
+                               "Export a fresh copy with the private-window method.")
+        if "does not look like a netscape" in low or "must be netscape formatted" in low:
+            return "bad_file", "yt-dlp could not read the file as Netscape cookies"
+        if "login details are needed" in low:
+            return "signed_out", "YouTube did not accept the login cookies"
+        if "not a bot" in low:
+            return "error", "YouTube wants bot verification even with these cookies - wait and retry"
+        if result.returncode == 0:
+            return "valid", f"YouTube accepted the cookies ({rep.summary()})"
+        errors = [l for l in output.splitlines() if l.strip().upper().startswith("ERROR:")]
+        return "error", (errors[-1][:200] if errors else f"yt-dlp exited with code {result.returncode}")
+
+    def get_arguments_ytdlp(self) -> List[str]:
+        """Get yt-dlp cookie arguments if cookies are available."""
+        path, _ = self.prepare_for_ytdlp()
+        return ["--cookies", str(path)] if path else []
+
+    # ==================== Browsers ====================
     def _check_admin(self) -> bool:
         """Check if script is running with admin privileges on Windows"""
         if platform.system() == "Windows":
@@ -120,214 +478,237 @@ class CookieManager:
             except Exception:
                 return False
         return True
-                
-    def get_status(self):
-        """Check available browser cookies and report status."""
-        Enhanced_Menu.print_header("Checking available browser cookies....")
 
-        if platform.system() == "Windows" and not self.is_admin:
-            Enhanced_Menu.print_status("⚠️ Running without admin privileges on Windows", "warning")
-            Enhanced_Menu.print_status("Some browsers may not be accessible", "info")
-
-        available_browsers = []
-
-        for browser, cookie_func in self.cookie_sources.items():
-            try:
-                # Convert generator to list to avoid exhaustion
-                cookies = list(cookie_func(domain_name="music.youtube.com"))
-                cookie_count = len(cookies)
-                if cookie_count > 0:
-                    available_browsers.append(browser)
-                    Enhanced_Menu.print_status(f"✓ {browser}: Found {cookie_count} cookies", "success")
-                else:
-                    Enhanced_Menu.print_status(f"• {browser}: No cookies found", "info")
-            except PermissionError as e:
-                if "admin" in str(e).lower():
-                    Enhanced_Menu.print_status(f"⚠️ {browser}: Need admin rights", "warning")
-                else:
-                    Enhanced_Menu.print_status(f"⚠️ {browser}: Permission denied", "warning")
-            except Exception as e:
-                Enhanced_Menu.print_status(f"⚠️ {browser}: {str(e)[:50]}", "error")
-
-        if available_browsers:
-            Enhanced_Menu.print_status(f"✅ Available cookies from: {', '.join(available_browsers)}", "success")
+    def _require_browser_support(self) -> bool:
+        if self.cookie_sources:
             return True
-        else:
-            Enhanced_Menu.print_status("❌ No browser cookies found for YouTube Music", "error")
-            Enhanced_Menu.print_status("Try:\n1. Run as Administrator\n2. Manual export\n3. Use yt-dlp auth", "info")
+        Enhanced_Menu.print_status(
+            "Reading cookies straight from a browser needs browser_cookie3: pip install browser_cookie3",
+            "error")
+        Enhanced_Menu.print_status("The manual export works without it.", "info")
+        return False
+
+    def get_status(self):
+        """Check which browsers hold YouTube cookies, and whether they're signed in."""
+        Enhanced_Menu.print_header("Checking available browser cookies....")
+        if not self._require_browser_support():
             return False
 
-    def extract_cookies(self, browser_name: str = 'brave') -> Optional[Path]:
-        """Extract cookies from specified browser and save to a file."""
-        Enhanced_Menu.print_header(f"Extracting cookies from {browser_name}....")
+        available_browsers = []
+        for browser, cookie_func in self.cookie_sources.items():
+            try:
+                # "youtube.com" also matches music.youtube.com. Filtering on
+                # "music.youtube.com" alone misses the login cookies, which
+                # sit on .youtube.com.
+                cookies = list(cookie_func(domain_name="youtube.com"))
+                names = {c.name for c in cookies if _is_youtube_domain(c.domain)}
+                if not names:
+                    Enhanced_Menu.print_status(f"• {browser}: No YouTube cookies", "info")
+                    continue
+                available_browsers.append(browser)
+                signed_in = LOGIN_COOKIE in names and any(n in names for n in SAPISID_COOKIES)
+                state = "signed in" if signed_in else "not signed in"
+                Enhanced_Menu.print_status(f"✓ {browser}: {len(cookies)} cookies, {state}",
+                                           "success" if signed_in else "warning")
+            except PermissionError:
+                Enhanced_Menu.print_status(f"⚠️ {browser}: Permission denied (close the browser and retry)", "warning")
+            except Exception as e:
+                Enhanced_Menu.print_status(f"• {browser}: {str(e)[:60]}", "info")
 
-        if browser_name not in self.cookie_sources:
-            Enhanced_Menu.print_status("Browser not supported", "error")
-            Enhanced_Menu.print_status(f"Available browsers: {', '.join(self.cookie_sources.keys())}", "info")
+        if available_browsers:
+            Enhanced_Menu.print_status(f"✅ YouTube cookies found in: {', '.join(available_browsers)}", "success")
+            return True
+        Enhanced_Menu.print_status("❌ No browser cookies found for YouTube", "error")
+        Enhanced_Menu.print_status("Use the manual export (private-window method) instead.", "info")
+        return False
+
+    def extract_cookies(self, browser_name: str = 'firefox') -> Optional[Path]:
+        """Extract YouTube cookies from a browser into a yt-dlp-readable file."""
+        Enhanced_Menu.print_header(f"Extracting cookies from {browser_name}....")
+        if not self._require_browser_support():
             return None
 
-        if platform.system() == "Windows" and not self.is_admin:
-            Enhanced_Menu.print_status("⚠️  Warning: Running without admin privileges", "warning")
-            Enhanced_Menu.print_status("Cookie extraction may fail. Consider:", "info")
-            Enhanced_Menu.print_status("1. Run as Administrator", "info")
-            Enhanced_Menu.print_status("2. Use manual export (option in menu)", "info")
-            proceed = Enhanced_Menu.get_input("Continue anyway? (y/n): ", "yn", default=False)
-            if not proceed:
-                return None
+        browser_name = (browser_name or "").strip().lower()
+        if browser_name not in self.cookie_sources:
+            Enhanced_Menu.print_status("Browser not supported", "error")
+            Enhanced_Menu.print_status(f"Available browsers: {', '.join(self.cookie_sources)}", "info")
+            return None
+
+        if platform.system() == "Windows" and browser_name in CHROMIUM_BROWSERS:
+            Enhanced_Menu.print_status(
+                "Recent Chrome-based browsers on Windows encrypt cookies in a way outside tools "
+                "often can't read. If this fails, use Firefox or the manual export.", "warning")
 
         try:
-            domains = ['music.youtube.com', 'youtube.com', 'open.spotify.com']
-            all_cookies = []
-            cookie_ids = set()  # Track unique cookies by name+value prefix
-
-            for domain in domains:
-                try:
-                    # Get cookies as a list to avoid generator exhaustion
-                    cookies = list(self.cookie_sources[browser_name](domain_name=domain))
-                    for cookie in cookies:
-                        cookie_key = f"{cookie.name}:{cookie.value[:30]}"
-                        if cookie_key not in cookie_ids:
-                            cookie_ids.add(cookie_key)
-                            all_cookies.append(cookie)
-                    Enhanced_Menu.print_status(
-                        f"Found {len(cookies)} cookies for {domain}",
-                        "success" if cookies else "info"
-                    )
-                except PermissionError as e:
-                    Enhanced_Menu.print_status(f"Permission denied for {domain}: Need admin rights", "error")
-                    return self._handle_permission_error(browser_name)
-                except Exception as e:
-                    Enhanced_Menu.print_status(f"Couldn't get cookies for {domain}: {str(e)[:50]}", "error")
-
-            if not all_cookies:
-                Enhanced_Menu.print_status(f"No cookies found for YouTube Music in {browser_name}", "info")
-                return None
-
-            # Save cookies to file in Netscape format
-            cookie_file = self.cookie_directory / f"{browser_name}_cookies.txt"
-            with open(cookie_file, "w", encoding='utf-8') as f:
-                f.write("# Netscape HTTP cookie file\n")
-                f.write("# This file was generated by Music Downloader\n")
-                for cookie in all_cookies:
-                    # Use the domain exactly as provided by browser_cookie3
-                    # (may already have a leading dot for domain-wide cookies)
-                    domain = cookie.domain
-                    domain_dot = "TRUE" if domain.startswith('.') else "FALSE"
-                    path = cookie.path or '/'
-                    secure = "TRUE" if cookie.secure else "FALSE"
-                    expires = str(int(cookie.expires)) if cookie.expires else "0"
-                    f.write(f"{domain}\t{domain_dot}\t{path}\t{secure}\t{expires}\t{cookie.name}\t{cookie.value}\n")
-
-            Enhanced_Menu.print_status(f"Successfully extracted {len(all_cookies)} cookies to {cookie_file}", "success")
-            Enhanced_Menu.print_status(f"Cookies saved to: {cookie_file}", "info")
-            self.current_cookie_file = cookie_file
-            return cookie_file
-
+            cookies = list(self.cookie_sources[browser_name](domain_name="youtube.com"))
+        except PermissionError:
+            Enhanced_Menu.print_status("Permission denied reading the browser's cookie store", "error")
+            return self._handle_permission_error(browser_name)
         except Exception as e:
-            Enhanced_Menu.print_status(f"Failed to extract cookies: {str(e)}", "error")
+            Enhanced_Menu.print_status(f"Failed to read cookies: {str(e)[:120]}", "error")
             return self._handle_permission_error(browser_name)
 
+        now = time.time()
+        unique = {}
+        skipped = 0
+        for cookie in cookies:
+            if not _is_youtube_domain(cookie.domain):
+                continue
+            if cookie.expires and cookie.expires < now:
+                continue
+            value = str(cookie.value or "")
+            if any(ch in value or ch in cookie.name for ch in "\t\r\n"):
+                skipped += 1            # would break the tab-separated format
+                continue
+            # Keyed on domain + path + name. The old name+value-prefix key could
+            # drop a real cookie that happened to share a value prefix.
+            unique[(cookie.domain, cookie.path or "/", cookie.name)] = cookie
+
+        if not unique:
+            Enhanced_Menu.print_status(
+                f"No YouTube cookies in {browser_name}. Sign in to music.youtube.com there first.", "info")
+            return None
+
+        lines = [NETSCAPE_HEADER,
+                 "# Written by Music Downloader. Treat this file like a password:",
+                 "# it signs in to your Google account.",
+                 ""]
+        for cookie in unique.values():
+            lines.append("\t".join([
+                cookie.domain,
+                "TRUE" if cookie.domain.startswith(".") else "FALSE",
+                cookie.path or "/",
+                "TRUE" if cookie.secure else "FALSE",
+                str(int(cookie.expires)) if cookie.expires else "0",
+                cookie.name,
+                str(cookie.value or ""),
+            ]))
+
+        cookie_file = self.cookie_directory / f"{browser_name}_cookies.txt"
+        try:
+            _write_private(cookie_file, "\n".join(lines) + "\n")
+        except OSError as e:
+            Enhanced_Menu.print_status(f"Could not write {cookie_file}: {e}", "error")
+            return None
+
+        rep = inspect_cookie_file(cookie_file)
+        note = f" ({skipped} unusable skipped)" if skipped else ""
+        Enhanced_Menu.print_status(f"Saved {len(unique)} cookies to {cookie_file}{note}", "success")
+        if rep.signed_in:
+            Enhanced_Menu.print_status(
+                "Signed-in session found. YouTube rotates cookies in open browser tabs, which can "
+                "sign this copy out later - if that happens, use the private-window export.", "info")
+        else:
+            Enhanced_Menu.print_status(
+                f"{browser_name} has no signed-in YouTube session, so age-restricted and "
+                "members-only content still won't download.", "warning")
+
+        self.set_active(cookie_file)
+        return cookie_file
+
     def _handle_permission_error(self, browser_name: str) -> Optional[Path]:
-        """Handle permission errors by offering alternatives."""
+        """Explain why reading the browser failed and offer the manual route."""
         Enhanced_Menu.print_section("\n🔧 Cookie Extraction Failed")
         Enhanced_Menu.print_status("This usually happens because:", "info")
-        Enhanced_Menu.print_status("• Browser is running in protected mode", "info")
-        Enhanced_Menu.print_status("• Need administrator privileges", "info")
-        Enhanced_Menu.print_status("• Browser cookies are encrypted", "info")
+        Enhanced_Menu.print_status("• The browser is open and has its cookie database locked", "info")
+        Enhanced_Menu.print_status("• The browser encrypts cookies in a way outside tools can't read", "info")
+        Enhanced_Menu.print_status("• The program lacks permission to read the browser profile", "info")
 
         print(f"\n{Fore.CYAN}Alternative solutions:{Style.RESET_ALL}")
-        print("1. Run this program as Administrator")
-        print("2. Use manual cookie export:")
-        print("   • Install 'Get cookies.txt' extension for Chrome/Edge")
-        print("   • Export cookies from music.youtube.com")
-        print("   • Load the exported file using option 4")
-        print("3. Use yt-dlp authentication (option 9)")
-        print("4. Try a different browser")
+        print("1. Close the browser completely and try again")
+        print("2. Try Firefox, which outside tools can usually read")
+        print("3. Use the manual export (recommended - it also avoids cookie rotation)")
+        print("4. Run this program as Administrator")
 
-        choice = Enhanced_Menu.get_input(
-            "\nTry manual export now? (y/n): ",
-            "yn",
-            default=True
-        )
-        if choice:
+        if Enhanced_Menu.get_input("\nShow the manual export steps now? (y/n): ", "yn", default=True):
             return self.manual_cookie_instructions()
         return None
 
     def manual_cookie_instructions(self) -> Optional[Path]:
-        """Guide user through manual cookie export and load the file."""
-        Enhanced_Menu.print_section("\n📋 Manual Cookie Export Instructions")
+        """Guide the user through a safe manual export, then load the file."""
+        Enhanced_Menu.print_section("\n📋 Manual Cookie Export (private-window method)")
+        print("This follows yt-dlp's guide for YouTube cookies:")
+        print(f"  {COOKIE_HOWTO_URL}")
 
-        print(f"\n{Fore.YELLOW}For Chrome/Edge/Brave:{Style.RESET_ALL}")
-        print("1. Install 'Get cookies.txt' extension:")
-        print("   • Chrome: https://chrome.google.com/webstore/detail/get-cookiestxt/bgaddhkoddajcdgocldbbfleckgcbcid")
-        print("   • Edge: Get from Chrome Web Store")
-        print("2. Go to https://music.youtube.com")
-        print("3. Make sure you're logged in")
-        print("4. Click the extension icon → 'Export'")
-        print("5. Save the file to the 'cookies' folder")
+        print(f"\n{Fore.YELLOW}1.{Style.RESET_ALL} Open a private/incognito window and sign in to YouTube there.")
+        print(f"{Fore.YELLOW}2.{Style.RESET_ALL} In that window, keep just one tab on https://music.youtube.com")
+        print(f"{Fore.YELLOW}3.{Style.RESET_ALL} Export the youtube.com cookies in Netscape (cookies.txt) format, not JSON:")
+        print(f"     • Chrome / Edge / Brave: \"Get cookies.txt LOCALLY\"")
+        print(f"       {LOCALLY_EXTENSION_URL}")
+        print(f"     • Firefox: \"cookies.txt\"")
+        print("     The extension has to be allowed in private windows.")
+        print(f"{Fore.YELLOW}4.{Style.RESET_ALL} Close the private window straight away. Don't sign out first.")
+        print("     YouTube rotates cookies in open sessions; closing the window keeps the export valid.")
 
-        print(f"\n{Fore.YELLOW}For Firefox:{Style.RESET_ALL}")
-        print("1. Install 'cookies.txt' extension")
-        print("2. Go to https://music.youtube.com")
-        print("3. Click extension → 'Export Cookies'")
+        print(f"\n{Fore.RED}⚠ Avoid the older \"Get cookies.txt\" extension (without LOCALLY).{Style.RESET_ALL}")
+        print("  It was reported as malware and removed from the Chrome Web Store.")
+        print("  If you have it installed, remove it.")
 
         cookie_path = Enhanced_Menu.get_input(
-            "\nEnter path to exported cookie file (or press Enter to skip): ",
-            "str"
-        )
+            "\nEnter path to exported cookie file (or press Enter to skip): ", "str")
         if cookie_path:
             return self.load_cookies(cookie_path)
         return None
 
+    # ==================== Files ====================
     def load_cookies(self, cookie_file: str) -> Optional[Path]:
-        """Load cookies from an existing file."""
-        cookie_path = Path(cookie_file)
-
-        # Try different paths
-        if not cookie_path.exists():
-            cookie_path = self.cookie_directory / cookie_file
-        if not cookie_path.exists():
-            cookie_path = Path(cookie_file)  # absolute path
-        if not cookie_path.exists():
-            Enhanced_Menu.print_status(f"Cookie file not found: {cookie_file}", "failure")
+        """Load cookies from a file, check them, and make them active."""
+        # Drag-and-drop on Windows wraps the path in quotes.
+        name = str(cookie_file).strip().strip('"').strip("'")
+        cookie_path = Path(name).expanduser()
+        if not cookie_path.is_file():
+            cookie_path = self.cookie_directory / name
+        if not cookie_path.is_file():
+            Enhanced_Menu.print_status(f"Cookie file not found: {name}", "failure")
             return None
 
-        try:
-            # Validate file format (simple check)
-            with open(cookie_path, 'r', encoding='utf-8') as f:
-                content = f.read(200)
-                if "Netscape" not in content and ".youtube.com" not in content:
-                    Enhanced_Menu.print_status("Warning: Cookie file may not be in Netscape format", "error")
-                    proceed = Enhanced_Menu.get_input("Continue anyway? (y/n): ", "yn", default=False)
-                    if not proceed:
-                        return None
-
-            self.current_cookie_file = cookie_path
-            Enhanced_Menu.print_status(f"Cookies loaded from: {cookie_path}", "info")
-            return cookie_path
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Failed to load cookies: {e}", "failure")
+        rep = inspect_cookie_file(cookie_path)
+        if not rep.readable:
+            Enhanced_Menu.print_status(f"Failed to load cookies: {rep.error}", "failure")
             return None
+        if rep.json_format:
+            Enhanced_Menu.print_status(
+                "That is a JSON export. Export again choosing the Netscape / cookies.txt format.", "failure")
+            return None
+        if not rep.entries:
+            Enhanced_Menu.print_status("No cookies found in that file.", "failure")
+            return None
+        if rep.repairable:
+            fixed = self.repair_cookie_file(cookie_path)
+            if not fixed:
+                return None
+            cookie_path, rep = fixed, inspect_cookie_file(fixed)
+
+        Enhanced_Menu.print_status(f"{cookie_path.name}: {rep.summary()}",
+                                   "success" if rep.signed_in else "warning")
+        if not rep.signed_in:
+            Enhanced_Menu.print_status(
+                "Without a signed-in session these cookies won't help with age-restricted, "
+                "members-only or bot-check errors.", "warning")
+            if not Enhanced_Menu.get_input("Use this file anyway? (y/n): ", "yn", default=False):
+                return None
+
+        self.set_active(cookie_path)
+        Enhanced_Menu.print_status(f"Active cookie file: {self.current_cookie_file}", "info")
+        return self.current_cookie_file
 
     def save_cookies(self, name: str = "cookies") -> Optional[Path]:
-        """Save current cookie file to persistent storage with a warning."""
-        if not self.current_cookie_file or not self.current_cookie_file.exists():
+        """Save a timestamped copy of the active cookie file."""
+        active = self.get_active_cookie_file()
+        if not active:
             Enhanced_Menu.print_status("No active cookie file to save", "error")
             return None
 
-        # Security warning
         Enhanced_Menu.print_status(
-            "⚠️  WARNING: Cookies will be stored in plain text. Protect this file.",
-            "warning"
-        )
-        proceed = Enhanced_Menu.get_input("Proceed with saving? (y/n): ", "yn", default=True)
-        if not proceed:
+            "⚠️  WARNING: Cookies are stored in plain text and sign in to your Google account. "
+            "Protect this file.", "warning")
+        if not Enhanced_Menu.get_input("Proceed with saving? (y/n): ", "yn", default=True):
             return None
 
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             save_path = self.cookie_directory / f"{name}_{timestamp}.txt"
-            shutil.copy2(self.current_cookie_file, save_path)
+            _write_private(save_path, active.read_bytes())
             Enhanced_Menu.print_status(f"Cookies saved to: {save_path}", "success")
             return save_path
         except Exception as e:
@@ -335,38 +716,41 @@ class CookieManager:
             return None
 
     def list_cookies(self) -> List[Path]:
-        """List all saved cookie files."""
-        cookie_files = list(self.cookie_directory.glob("*.txt"))
+        """List saved cookie files with what each one holds."""
+        cookie_files = sorted(self.cookie_directory.glob("*.txt"),
+                              key=lambda p: p.stat().st_mtime, reverse=True)
         if not cookie_files:
             Enhanced_Menu.print_status("No saved cookie files found.", "error")
             return []
 
+        active = self.get_active_cookie_file()
         Enhanced_Menu.print_status("Saved cookie files:", "info")
         for i, cookie_file in enumerate(cookie_files, 1):
-            file_size = cookie_file.stat().st_size
             mod_time = time.strftime("%Y-%m-%d %H:%M", time.localtime(cookie_file.stat().st_mtime))
-            print(f"{Fore.YELLOW}[{i}]{Style.RESET_ALL} {Fore.CYAN}{cookie_file.name:30}{Style.RESET_ALL}")
-            print(f"     Size: {file_size} bytes | Modified: {mod_time}")
+            marker = f" {Fore.GREEN}(active){Style.RESET_ALL}" if active and cookie_file.resolve() == active else ""
+            print(f"{Fore.YELLOW}[{i}]{Style.RESET_ALL} {Fore.CYAN}{cookie_file.name:30}{Style.RESET_ALL}{marker}")
+            print(f"     {self.report(cookie_file).summary()} | Modified: {mod_time}")
         return cookie_files
 
     def clear_cookies(self):
         """Delete all cookie files from the main cookie directory."""
         try:
-            deleted_count = 0
             cookie_files = list(self.cookie_directory.glob("*.txt"))
             if not cookie_files:
-                Enhanced_Menu.print_color("No cookie files found in {}".format(self.cookie_directory))
+                Enhanced_Menu.print_status(f"No cookie files found in {self.cookie_directory}", "info")
                 return
 
-            Enhanced_Menu.print_color("Found {} cookie file(s) to delete:".format(len(cookie_files)))
+            Enhanced_Menu.print_status(f"Found {len(cookie_files)} cookie file(s) to delete:", "info")
             for cookie_file in cookie_files:
-                Enhanced_Menu.print_color("  - {}".format(cookie_file.name))
+                print(f"  - {cookie_file.name}")
 
-            confirm = input("\nAre you sure you want to delete ALL {} cookie files? (y/n): ".format(len(cookie_files))).strip().lower()
-            if confirm not in ['y', 'yes']:
+            if not Enhanced_Menu.get_input(
+                    f"\nAre you sure you want to delete ALL {len(cookie_files)} cookie files? (y/n): ",
+                    "yn", default=False):
                 Enhanced_Menu.print_status("Cookie deletion cancelled.", "failure")
                 return
 
+            deleted_count = 0
             for cookie_file in cookie_files:
                 try:
                     cookie_file.unlink()
@@ -375,401 +759,107 @@ class CookieManager:
                 except Exception as e:
                     Enhanced_Menu.print_status(f"Failed to delete {cookie_file.name}: {e}", "failure")
 
-            if self.current_cookie_file and not self.current_cookie_file.exists():
-                self.current_cookie_file = None
+            if not self.get_active_cookie_file():
+                self.set_active(None)
+            self._report_cache.clear()
 
-            Enhanced_Menu.print_status(f"\nSuccessfully deleted {deleted_count} cookie file(s) from {self.cookie_directory}", "success")
+            Enhanced_Menu.print_status(
+                f"\nSuccessfully deleted {deleted_count} cookie file(s) from {self.cookie_directory}", "success")
         except Exception as e:
             Enhanced_Menu.print_status(f"Error clearing cookies: {e}", "error")
 
-    def test_cookies(self, url="https://music.youtube.com/watch?v=215T8NF93kw"):
-        """Test if cookies work by trying to access a URL."""
-        if not self.current_cookie_file:
-            Enhanced_Menu.print_status("No active cookie file to test", "error")
-            return False
+    def test_cookies(self, url=None) -> bool:
+        """Check the active cookies with yt-dlp. `url` is accepted for compatibility and unused."""
+        verdict, detail = self.verify_with_ytdlp()
+        if verdict == "valid":
+            Enhanced_Menu.print_status(f"✅ {detail}", "success")
+            return True
+        Enhanced_Menu.print_status(f"❌ {detail}", "error")
+        if verdict in ("rotated", "signed_out"):
+            Enhanced_Menu.print_status("Use the manual export (private-window method) to get cookies that last.", "info")
+        return False
 
-        try:
-            session = requests.Session()
-            with open(self.current_cookie_file, 'r') as f:
-                for line in f:
-                    if line.startswith('#') or not line.strip():
-                        continue
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 7:
-                        session.cookies.set(
-                            name=parts[5],
-                            value=parts[6],
-                            domain=parts[0],
-                            path=parts[2]
-                        )
-
-            response = session.get(url, timeout=10)
-            if response.status_code == 200:
-                Enhanced_Menu.print_status("✅ Cookies work! Successfully accessed URL", "success")
-                return True
-            else:
-                Enhanced_Menu.print_status(f"❌ Cookies may not work. Status code: {response.status_code}", "error")
-                return False
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Error testing cookies: {e}", "error")
-            return False
-        
-    def get_auth_key(self) -> Optional[str]:
+    def ytdlp_auth(self) -> bool:
         """
-        Execute the curl command to obtain a Spotify access token using client credentials.
-        Returns the access token string or None on failure.
+        yt-dlp can't sign in to YouTube with a username and password - it
+        prints "Login with password is not supported for YouTube" - so this
+        verifies the cookies instead of asking for a password.
         """
-        if not self._client_id or not self._client_secret:
-            Enhanced_Menu.print_status(
-                "Client ID and Secret are required. Please run spotify_auth first.",
-                "error"
-            )
-            return None
+        Enhanced_Menu.print_header("\n🎵 Checking YouTube sign-in...")
+        Enhanced_Menu.print_status(
+            "YouTube sign-in works through cookies only; no password is needed or used.", "info")
+        return self.test_cookies()
 
-        # Check if curl is available
-        if not shutil.which("curl"):
-            Enhanced_Menu.print_status("curl not found in PATH. Please install curl.", "error")
-            return None
+    # ==================== Menu ====================
+    def _menu_extract(self):
+        if not self._require_browser_support():
+            return
+        print(f"\n====={Fore.CYAN}Available Browsers:{Style.RESET_ALL}======")
+        browsers = list(self.cookie_sources)
+        for i, browser in enumerate(browsers, 1):
+            print(f"{i}. {browser}")
+        choice = (Enhanced_Menu.get_input("\nSelect browser (name or number): ", "str") or "").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(browsers):
+            choice = browsers[int(choice) - 1]
+        if choice:
+            self.extract_cookies(choice)
 
-        # Build the command (Windows line continuation characters removed)
-        command = [
-            "curl", "-X", "POST",
-            "https://accounts.spotify.com/api/token",
-            "-H", "Content-Type: application/x-www-form-urlencoded",
-            "-d", f"grant_type=client_credentials&client_id={self._client_id}&client_secret={self._client_secret}"
-        ]
+    def _menu_list(self):
+        cookie_files = self.list_cookies()
+        if cookie_files:
+            load_choice = (Enhanced_Menu.get_input(
+                "\nEnter number to make that file active (or press Enter to skip): ", "str") or "").strip()
+            if load_choice.isdigit() and 0 < int(load_choice) <= len(cookie_files):
+                self.load_cookies(str(cookie_files[int(load_choice) - 1]))
 
-        Enhanced_Menu.print_status("Requesting access token from Spotify...", "info")
+    def _menu_load(self):
+        cookie_file = (Enhanced_Menu.get_input("Enter cookie filename or path: ", "str") or "").strip()
+        if cookie_file:
+            self.load_cookies(cookie_file)
 
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30
-            )
-
-            if result.returncode != 0:
-                Enhanced_Menu.print_status(f"curl failed with error:\n{result.stderr}", "error")
-                return None
-
-            # Parse JSON response
-            try:
-                response = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                Enhanced_Menu.print_status("Failed to parse JSON response from Spotify.", "error")
-                Enhanced_Menu.print_status(f"Raw output: {result.stdout[:200]}", "debug")
-                return None
-
-            # Extract access token
-            access_token = response.get("access_token")
-            if access_token:
-                self._auth_token = access_token
-                Enhanced_Menu.print_status("Access token obtained successfully.", "success")
-                return access_token
-            else:
-                error_msg = response.get("error", "Unknown error")
-                error_desc = response.get("error_description", "")
-                Enhanced_Menu.print_status(f"Spotify error: {error_msg} {error_desc}", "error")
-                return None
-
-        except subprocess.TimeoutExpired:
-            Enhanced_Menu.print_status("curl command timed out after 30 seconds.", "error")
-            return None
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Unexpected error while obtaining auth key: {e}", "error")
-            return None        
-           
-    def spotify_auth(self):
-        """Use spotdl's built‑in authentication with automatic token fetching."""
-        Enhanced_Menu.print_header("\n🎵 Starting Spotify authentication...")
-
-        # Get Client ID (with instructions)
-        while True:
-            client_id = Enhanced_Menu.get_input(
-                "Enter the Client ID of your Spotify Web API (or 'get' for instructions): ",
-                "str"
-            )
-            if not client_id:
-                self._client_id = None
-                Enhanced_Menu.print_status("No Client ID provided, program may fail", "warning")
-                break
-            if client_id.lower() == 'get':
-                print(" 1. Go to Spotify for Developers")
-                print(" 2. Go to the app you created (make sure it's a Web API app)")
-                print(" 3. Copy the Client ID from the app dashboard")
-                continue
-            self._client_id = client_id
-            break
-
-        # Get Client Secret
-        while True:
-            client_secret = Enhanced_Menu.get_input(
-                "Enter the Client Secret of your Spotify Web API (or 'get' for instructions): ",
-                "str"
-            )
-            if not client_secret:
-                self._client_secret = None
-                Enhanced_Menu.print_status("No Client Secret provided, program may fail", "warning")
-                break
-            if client_secret.lower() == 'get':
-                print(" 1. Go to Spotify for Developers")
-                print(" 2. Go to the app you created")
-                print(" 3. Click 'Show Client Secret' and copy the text")
-                continue
-            self._client_secret = client_secret
-            break
-
-        # Auto‑fetch token if both credentials are present
-        if self._client_id and self._client_secret:
-            Enhanced_Menu.print_status("Attempting to fetch access token using client credentials...", "info")
-            token = self.get_auth_key()          # sets self._auth_token and returns it
-            if token:
-                Enhanced_Menu.print_status("Access token obtained successfully.", "success")
-            else:
-                Enhanced_Menu.print_status("Failed to obtain access token automatically.", "error")
-                # Offer manual token entry
-                manual = Enhanced_Menu.get_input(
-                    "Would you like to enter an access token manually? (y/n): ",
-                    "yn",
-                    default=False
-                )
-                if manual:
-                    while True:
-                        auth_token = Enhanced_Menu.get_input(
-                            "Enter the Auth Token (or 'get' for instructions): ",
-                            "str"
-                        )
-                        if not auth_token:
-                            self._auth_token = None
-                            Enhanced_Menu.print_status("No Auth Token provided, continuing without token.", "warning")
-                            break
-                        if auth_token.lower() == 'get':
-                            print(" 1. Go to this link: https://developer.spotify.com/documentation/web-api/tutorials/getting-started")
-                            print(" 2. Scroll down to the area where it says 'Request an access token'")
-                            print(" 3. Follow the instructions given to acquire your access token.")
-                            print(" Note: The auth token/access token only lasts for an hour, so best to renew consistently")
-                            continue
-                        self._auth_token = auth_token
-                        break
-        else:
-            # Credentials missing; optionally ask for manual token
-            Enhanced_Menu.print_status("Client ID and/or Secret not provided. Automatic token fetch skipped.", "info")
-            manual = Enhanced_Menu.get_input(
-                "Would you like to enter an access token manually? (y/n): ",
-                "yn",
-                default=False
-            )
-            if manual:
-                while True:
-                    auth_token = Enhanced_Menu.get_input(
-                        "Enter the Auth Token (or 'get' for instructions): ",
-                        "str"
-                    )
-                    if not auth_token:
-                        self._auth_token = None
-                        Enhanced_Menu.print_status("No Auth Token provided, continuing without token.", "warning")
-                        break
-                    if auth_token.lower() == 'get':
-                        print(" 1. Go to this link: https://developer.spotify.com/documentation/web-api/tutorials/getting-started")
-                        print(" 2. Scroll down to the area where it says 'Request an access token'")
-                        print(" 3. Follow the instructions given to acquire your access token.")
-                        print(" Note: The auth token/access token only lasts for an hour, so best to renew consistently")
-                        continue
-                    self._auth_token = auth_token
-                    break
-
-        # Check if spotdl is installed
-        if not shutil.which("spotdl"):
-            Enhanced_Menu.print_status("spotdl not found in PATH. Please install it first.", "error")
-            return False
-
-        # Build base command
-        command = ["spotdl", "download", "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT", ]
-        if self._client_id:
-            command += ["--client-id", self._client_id]
-        if self._client_secret:
-            command += ["--client-secret", self._client_secret]
-        if self._auth_token:
-            command += ["--auth-token", self._auth_token]
-
-        # Test authentication with a dry run
-        try:
-            process = subprocess.run(
-                command,
-                capture_output=True,
-                text=True
-            )
-            if process.returncode == 0:
-                Enhanced_Menu.print_status("Authentication successful!", "success")
-                self.save_credentials()
-                return True
-            else:
-                Enhanced_Menu.print_status("Authentication failed", "error")
-                self.save_credentials()
-                if process.stderr:
-                    print(process.stderr)
-                return False
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Error during authentication: {e}", "error")
-            return False
-
-    def ytdlp_auth(self):
-        """Use yt‑dlp's built‑in authentication."""
-        Enhanced_Menu.print_header("\n🎵 Starting YouTube Music authentication...")
-
-        if not self.current_cookie_file or not self.current_cookie_file.exists():
-            Enhanced_Menu.print_status("No active cookie file. Please load cookies first.", "error")
-            return False
-
-        username = Enhanced_Menu.get_input("Enter your account username: ")
-        password = Enhanced_Menu.get_input("Enter your account password: ")
-
-        if not shutil.which("yt-dlp"):
-            Enhanced_Menu.print_status("yt-dlp not found in PATH. Please install it first.", "error")
-            return False
-
-        try:
-            # Using --cookies and --username/--password together; password is visible in process list.
-            # For better security, consider using --netrc or environment variables.
-            process = subprocess.run(
-                [
-                    "yt-dlp",
-                    "--netrc",
-                    "--cookies", str(self.current_cookie_file),
-                    "--username", username,
-                    "--password", password,
-                    "--simulate",  # don't download anything
-                    "https://music.youtube.com/"
-                ],
-                capture_output=True,
-                text=True
-            )
-            if process.returncode == 0:
-                Enhanced_Menu.print_status("Authentication successful!", "success")
-                return True
-            else:
-                Enhanced_Menu.print_status("Authentication failed", "error")
-                if process.stderr:
-                    print(process.stderr)
-                return False
-        except Exception as e:
-            Enhanced_Menu.print_status(f"Error during authentication: {e}", "error")
-            return False
-
-    def get_arguments_ytdlp(self) -> List[str]:
-        """Get yt‑dlp cookie arguments if cookies are available."""
-        if self.current_cookie_file and self.current_cookie_file.exists():
-            return ["--cookies", str(self.current_cookie_file)]
-        return []
-
-    def get_arguments_spotdl(self) -> List[str]:
-        """Get spotdl cookie arguments if cookies are available."""
-        if self.current_cookie_file and self.current_cookie_file.exists():
-            return ["--cookie-file", str(self.current_cookie_file)]
-        return []
-
-    def __del__(self):
-        """Clear reference to current cookie file (does not delete the file)."""
-        self.current_cookie_file = None
+    def _menu_save(self):
+        if not self.get_active_cookie_file():
+            Enhanced_Menu.print_status("No active cookies to save", "info")
+            return
+        name = (Enhanced_Menu.get_input("Enter name for cookie file (optional): ", "str") or "").strip()
+        self.save_cookies(name or "cookies")
 
     def interactive_menu(self):
         """Interactive cookie setup menu."""
+        items = [
+            ("Check browsers for YouTube cookies", self.get_status),
+            ("Extract cookies from a browser", self._menu_extract),
+            ("Manual export (recommended: private-window method)", self.manual_cookie_instructions),
+            ("List saved cookie files / choose active", self._menu_list),
+            ("Load cookies from a file", self._menu_load),
+            ("Verify active cookies with yt-dlp", self.test_cookies),
+            ("Save a timestamped copy of the active cookies", self._menu_save),
+            ("Delete all cookie files", self.clear_cookies),
+        ]
         while True:
             Enhanced_Menu.clear_screen()
             Enhanced_Menu.print_header("🍪 Cookie Manager Menu", "A simple program to help manage cookies")
 
             Enhanced_Menu.print_section("Options:")
-            Enhanced_Menu.print_menu_item(1, "Check available browser cookies")
-            Enhanced_Menu.print_menu_item(2, "Extract cookies from browser")
-            Enhanced_Menu.print_menu_item(3, "List saved cookie files")
-            Enhanced_Menu.print_menu_item(4, "Load cookies from file")
-            Enhanced_Menu.print_menu_item(5, "Save current cookies")
-            Enhanced_Menu.print_menu_item(6, "Clear all cookie files")
-            Enhanced_Menu.print_menu_item(7, "Show current cookie status")
-            Enhanced_Menu.print_menu_item(8, "Use SpotDL Authentication")
-            Enhanced_Menu.print_menu_item(9, "Use YT-DLP Authentication")
-            Enhanced_Menu.print_menu_item(10, "Test current cookies")
-            Enhanced_Menu.print_menu_item(11, "Return to main menu")
+            for number, (label, _) in enumerate(items, 1):
+                Enhanced_Menu.print_menu_item(number, label)
+            back = len(items) + 1
+            Enhanced_Menu.print_menu_item(back, "Return to main menu")
 
             Enhanced_Menu.print_section("STATUS")
-            if self.current_cookie_file:
-                Enhanced_Menu.print_status(f"Active cookie file: {self.current_cookie_file}", "success")
+            active = self.get_active_cookie_file()
+            if active:
+                rep = self.report(active)
+                Enhanced_Menu.print_status(f"Active cookie file: {active}", "success" if rep.usable else "warning")
+                Enhanced_Menu.print_status(rep.summary(), "info")
             else:
                 Enhanced_Menu.print_status("No active cookie file", "error")
 
-            choice = input("Select option (1-11): ").strip()
-
-            if choice == "1":
-                self.get_status()
-                input("\nPress Enter to continue... ")
-            elif choice == "2":
-                print(f"\n====={Fore.CYAN}Available Browsers:{Style.RESET_ALL}======")
-                browsers = list(self.cookie_sources.keys())
-                for i, browser in enumerate(browsers, 1):
-                    Enhanced_Menu.print_color(f"{i}. {browser}")
-                browser_choice = Enhanced_Menu.get_input("\nSelect browser (name or number): ", "str").strip()
-                if browser_choice.isdigit():
-                    num = int(browser_choice)
-                    if 1 <= num <= len(browsers):
-                        browser_name = browsers[num - 1]
-                        self.extract_cookies(browser_name)
-                else:
-                    self.extract_cookies(browser_choice)
-
-                if self.current_cookie_file:
-                    save = Enhanced_Menu.get_input("Save these cookies for future use? (y/n): ", "yn", default=True)
-                    if save:
-                        name = Enhanced_Menu.get_input("Enter name for cookie file (optional): ", "str").strip()
-                        if not name:
-                            name = "cookies"
-                        self.save_cookies(name)
-                input("\nPress Enter to continue...")
-            elif choice == "3":
-                cookie_files = self.list_cookies()
-                if cookie_files:
-                    load_choice = Enhanced_Menu.get_input("\nEnter number to load cookie file (or press Enter to skip): ", "str")
-                    if load_choice.isdigit():
-                        idx = int(load_choice) - 1
-                        if 0 <= idx < len(cookie_files):
-                            self.load_cookies(str(cookie_files[idx]))
-                input("\nPress Enter to continue...")
-            elif choice == "4":
-                cookie_file = Enhanced_Menu.get_input("Enter cookie filename or path: ", "str").strip()
-                if cookie_file:
-                    self.load_cookies(cookie_file)
-                input("\nPress Enter to continue... ")
-            elif choice == "5":
-                if self.current_cookie_file:
-                    name = Enhanced_Menu.get_input("Enter name for cookie file (optional): ", "str", default="cookies")
-                    if not name:
-                        name = "cookies"
-                    self.save_cookies(name)
-                else:
-                    Enhanced_Menu.print_status("No active cookies to save", "info")
-                input("\nPress Enter to continue...")
-            elif choice == "6":
-                self.clear_cookies()
-                input("\nPress Enter to continue...")
-            elif choice == "7":
-                status = self.get_status()
-                if self.current_cookie_file:
-                    Enhanced_Menu.print_status(f"Active cookie file: {self.current_cookie_file.name}", "success")
-                else:
-                    Enhanced_Menu.print_status("No active cookie file", "info")
-                input("\nPress Enter to continue...")
-            elif choice == "8":
-                self.spotify_auth()
-                input("\nPress Enter to continue...")
-            elif choice == "9":
-                self.ytdlp_auth()
-                input("\nPress Enter to continue...")
-            elif choice == "10":
-                self.test_cookies()
-                input("\nPress Enter to continue...")
-            elif choice == "11":
+            choice = input(f"Select option (1-{back}): ").strip()
+            if choice == str(back):
                 break
+            if choice.isdigit() and 1 <= int(choice) <= len(items):
+                items[int(choice) - 1][1]()
             else:
                 Enhanced_Menu.print_status("Invalid choice", "info")
-                input("\nPress Enter to continue...")
+            input("\nPress Enter to continue...")

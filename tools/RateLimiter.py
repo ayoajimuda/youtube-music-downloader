@@ -83,15 +83,10 @@ THROTTLE_MARKERS = (
     "max retries reached", "sign in to confirm", "not a bot",
 )
 
-
 def looks_throttled(text: str) -> bool:
     """True if a line of subprocess output indicates the remote side is throttling."""
     low = (text or "").lower()
     return any(m in low for m in THROTTLE_MARKERS)
 
 
-# One shared bucket for YouTube. Both downloaders should use it: spotdl sources
-# its audio from YouTube too, so two independent streams would double the
-# request rate against the same host.
 youtube_limiter = RateLimiter(60, burst=4, name="youtube")
-spotify_limiter = RateLimiter(60, burst=4, name="spotify")
