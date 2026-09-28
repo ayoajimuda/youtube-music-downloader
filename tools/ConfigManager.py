@@ -24,8 +24,6 @@ class DownloaderConfigManager:
         "max_concurrent": (1, 16),
         "yt_dlp_sleep_min": (0, 3600),
         "yt_dlp_sleep_max": (0, 3600),
-        "max_downloads_per_minute": (1, 600),
-        "max_metadata_calls_per_minute": (1, 600),
     }
 
     _COMMON_DEFAULTS: Dict[str, Any] = {

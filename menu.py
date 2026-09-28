@@ -1,9 +1,7 @@
 import sys
 import time
-
 from pathlib import Path
 from colorama import init, Fore, Style
-
 from tools.EnhancedMenu import Enhanced_Menu
 from core.YoutubeMusicDownloader import YoutubeMusicDownloader
 
@@ -88,11 +86,6 @@ def main():
     # ------------------------------------------------------------------
     # Settings
     # ------------------------------------------------------------------
-    # Everything here goes through the downloader's public properties
-    # (audio_format / audio_quality / output_directory). Their setters validate
-    # the value and create the directory, so an invalid pick is rejected by the
-    # downloader itself instead of being written straight into a private
-    # attribute and only failing later, mid-download.
     def handle_settings():
         """Handle program settings menu"""
         while True:
@@ -243,13 +236,7 @@ def main():
     # ------------------------------------------------------------------
     # Menu definition
     # ------------------------------------------------------------------
-    # Rebuilt each pass so hints (the retry queue size) stay current, and
-    # numbered automatically rather than by hand - that keeps the printed
-    # numbers and the dispatch table in step, and stops "exit" from drifting
-    # away from the number the loop compares against.
-    #
-    # Entries are (label, hint, action, retryable); retryable marks the ones
-    # that return False on failure and are worth re-offering.
+
     def build_menu():
         queued = downloader.retry_queue_count
         retry_hint = (f"{Fore.YELLOW}{queued} link(s) waiting{Style.RESET_ALL}" if queued
@@ -277,10 +264,6 @@ def main():
                 ("Show Program Info", "", downloader.program_info, False),
                 ("Troubleshooting", "", downloader.troubleshooting, False),
                 ("Show yt-dlp Help", "", downloader.show_ytdlp_help, False),
-            ]),
-            ("📊 LOG MANAGEMENT", [
-                ("Log Manager", "", downloader.log_manager.interactive_menu, False),
-                ("Input History", "", downloader.history.interactive_menu, False),
             ]),
             ("🚪 EXIT", [
                 ("Exit Program", "", handle_exit, False),

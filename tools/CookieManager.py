@@ -31,20 +31,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-
+import browser_cookie3
 from colorama import init, Fore, Style
-
-try:
-    import browser_cookie3
-except ImportError:          # extraction is optional; file-based cookies still work
-    browser_cookie3 = None
-
 from .EnhancedMenu import Enhanced_Menu
-
-try:
-    from .RateLimiter import youtube_limiter
-except Exception:
-    youtube_limiter = None
 
 init(autoreset=True)
 
@@ -430,9 +419,6 @@ class CookieManager:
 
         if not shutil.which("yt-dlp"):
             return "no_ytdlp", "yt-dlp not found in PATH"
-
-        if youtube_limiter is not None:
-            youtube_limiter.acquire()
 
         run_copy = self.begin_run(path)
         command = ["yt-dlp", "--cookies", str(run_copy or path), "--simulate",

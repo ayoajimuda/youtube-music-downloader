@@ -813,6 +813,74 @@ class YoutubeMusicDownloader:
         Helpers.cleanup_directory(self.__output_directory, self.log_manager)
         return failed_count == 0
 
+    # ==================== Public download methods ====================
+    def download_track(self):
+        """Download a single track."""
+        return self._download_item(
+            item_type="track",
+            url_prompt="track URL",
+            output_template=str(self.__output_directory / "%(artist)s - %(title)s.%(ext)s"),
+            confirm_large=False,
+        )
+
+    def download_album(self):
+        """Download an album."""
+        return self._download_item(
+            item_type="album",
+            url_prompt="album URL",
+            output_template=str(self.__output_directory /
+                                "%(artist)s/%(album)s/%(artist)s - %(title)s.%(ext)s"),
+            confirm_large=True,
+            use_archive=True,
+        )
+
+    def download_playlist(self):
+        """Download a playlist with concurrent downloads."""
+        return self._download_item(
+            item_type="playlist",
+            url_prompt="playlist URL",
+            output_template=None,        # computed per-playlist inside
+            confirm_large=True,
+            concurrent=True,
+            max_workers=self.max_concurrent or 3,
+        )
+
+    def search_and_download(self):
+        """Search for a song and download it."""
+        Enhanced_Menu.clear_screen()
+        Enhanced_Menu.print_header("SEARCH & DOWNLOAD")
+        song_query = Enhanced_Menu.get_input(
+            "What is the name of the song you're looking for: ", "str")
+        song_query = (song_query or "").strip()
+        if not song_query:
+            Enhanced_Menu.print_status("No search query provided", "error")
+            return False
+
+        self.history.add_input(song_query, "search")
+        if Enhanced_Menu.get_input("Configure download settings? (y/n)", "yn", default=False):
+            self.get_user_preferences()
+
+        Enhanced_Menu.print_status("Searching for the song. Browsing through YouTube...", "info")
+        output_template = str(self.__output_directory / "Searches" /
+                              "%(artist)s - %(title)s.%(ext)s")
+
+        for attempt in range(1, self.max_retries + 1):
+            Enhanced_Menu.print_section(f"Search & download (Attempt {attempt}/{self.max_retries})")
+            if attempt > 1:
+                print(f"Waiting {self.retry_delay} seconds before retry...")
+                time.sleep(self.retry_delay)
+            try:
+                self.run_download(f"ytsearch1:{song_query}", output_template)
+                self.log_manager.log_success(f"Successfully downloaded: '{song_query}'")
+                return True
+            except RuntimeError:
+                raise
+            except Exception as e:
+                self.log_manager.log_error(f"Search download failed: {e}")
+
+        self.log_manager.log_failure(f"Failed after {self.max_retries} attempts: '{song_query}'")
+        return False
+
     # ==================== Batch download from a file ====================
     def download_from_file(self, file_path: str = None) -> bool:
         """
@@ -1138,74 +1206,6 @@ class YoutubeMusicDownloader:
         if succeeded:
             Helpers.cleanup_directory(self.__output_directory, self.log_manager)
         return failed == 0
-
-    # ==================== Public download methods ====================
-    def download_track(self):
-        """Download a single track."""
-        return self._download_item(
-            item_type="track",
-            url_prompt="track URL",
-            output_template=str(self.__output_directory / "%(artist)s - %(title)s.%(ext)s"),
-            confirm_large=False,
-        )
-
-    def download_album(self):
-        """Download an album."""
-        return self._download_item(
-            item_type="album",
-            url_prompt="album URL",
-            output_template=str(self.__output_directory /
-                                "%(artist)s/%(album)s/%(artist)s - %(title)s.%(ext)s"),
-            confirm_large=True,
-            use_archive=True,
-        )
-
-    def download_playlist(self):
-        """Download a playlist with concurrent downloads."""
-        return self._download_item(
-            item_type="playlist",
-            url_prompt="playlist URL",
-            output_template=None,        # computed per-playlist inside
-            confirm_large=True,
-            concurrent=True,
-            max_workers=self.max_concurrent or 3,
-        )
-
-    def search_and_download(self):
-        """Search for a song and download it."""
-        Enhanced_Menu.clear_screen()
-        Enhanced_Menu.print_header("SEARCH & DOWNLOAD")
-        song_query = Enhanced_Menu.get_input(
-            "What is the name of the song you're looking for: ", "str")
-        song_query = (song_query or "").strip()
-        if not song_query:
-            Enhanced_Menu.print_status("No search query provided", "error")
-            return False
-
-        self.history.add_input(song_query, "search")
-        if Enhanced_Menu.get_input("Configure download settings? (y/n)", "yn", default=False):
-            self.get_user_preferences()
-
-        Enhanced_Menu.print_status("Searching for the song. Browsing through YouTube...", "info")
-        output_template = str(self.__output_directory / "Searches" /
-                              "%(artist)s - %(title)s.%(ext)s")
-
-        for attempt in range(1, self.max_retries + 1):
-            Enhanced_Menu.print_section(f"Search & download (Attempt {attempt}/{self.max_retries})")
-            if attempt > 1:
-                print(f"Waiting {self.retry_delay} seconds before retry...")
-                time.sleep(self.retry_delay)
-            try:
-                self.run_download(f"ytsearch1:{song_query}", output_template)
-                self.log_manager.log_success(f"Successfully downloaded: '{song_query}'")
-                return True
-            except RuntimeError:
-                raise
-            except Exception as e:
-                self.log_manager.log_error(f"Search download failed: {e}")
-
-        self.log_manager.log_failure(f"Failed after {self.max_retries} attempts: '{song_query}'")
-        return False
 
     # ==================== Utilities ====================
     def manage_cookies(self):
