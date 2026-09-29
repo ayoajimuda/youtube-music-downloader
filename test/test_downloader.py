@@ -1,9 +1,4 @@
-""" Base downloader for the youtube music downloader. Contains only the download functions"""
-
-
-import re
 import os
-import random
 import subprocess
 import time
 import hashlib
@@ -14,60 +9,51 @@ from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from colorama import init, Fore, Style
-from assist_methods import cleanup_directory, sanitize_filename, parse_size
+
+from assist_methods import cleanup_directory
+from tools.EnhancedMenu import Enhanced_Menu
+from tools.Progress import DownloadProgress
+from tools.YtDlpErrors import (looks_throttled, has_error_line,
+                               already_downloaded, describe_failure)
+from utils.validators import Helpers
 
 init(autoreset=True)
 
-class _NullBar:
-    """No-op stand-in for tqdm so worker threads don't render nested bars."""
-    total = None
-    n = 0
-
-    def set_description(self, *args, **kwargs):
-        pass
-
-    def set_postfix_str(self, *args, **kwargs):
-        pass
-
-    def refresh(self):
-        pass
-
-    def close(self):
-        pass
-
-def looks_throttled(text: str) -> bool:
-    """True if yt-dlp output suggests YouTube is throttling or refusing us."""
-    low = (text or "").lower()
-    return any(marker in low for marker in _THROTTLE_MARKERS)
 
 class YoutubeMusicDownloader:
     """
-    Downloader class that contains all the download functions
+    Downloader class that contains the download functions.
+
+    Everything else lives elsewhere and is handed in:
+      log_manager, history, file_helpers, batch_file, cookies  - constructor
+      retry (RetryManager) and menu (Menu)                     - set by build_app,
+                                                                  since both need this object
     """
-    
-    def __init__(self):
+
+    def __init__(self, log_manager, history, file_helpers, batch_file, cookies):
+        self.log_manager = log_manager
+        self.history = history
+        self.file_helpers = file_helpers
+        self.batch_file = batch_file
+        self.cookies = cookies
+        self.retry = None                  # RetryManager, attached by build_app
+        self.menu = None                   # Menu, attached by build_app
+
         self.__output_directory = Path.home() / "Music" / "Collection" / "YouTube"
         self.__audio_quality = "320k"
         self.__audio_format = "mp3"
-        self.__configuration_file = r"config/YoutubeMusicDownloader.json"
-        self.use_cookies = False
-        self.max_retries = 2 # No of retries for a struggling download
-        self.retry_delay = 20 # The amount of time between each retry
-        self.download_timeout = 120 # seconds of silence before a download is killed
 
-        
-        self.debug = False
-        self.max_concurrency = 3 # Number of thread / downloads running at once
+        self.max_retries = 2               # attempts per link
+        self.retry_delay = 20              # seconds between attempts
+        self.download_timeout = 120        # seconds of *silence* before a download is killed
+        self.max_concurrency = 3           # downloads running at once in a playlist
         self.yt_dlp_sleep_min = 3          # min seconds yt-dlp waits between downloads
         self.yt_dlp_sleep_max = 7          # max seconds (random delay in this range)
-        
-        self.rate_limit_backoff = 300
-        self.rate_limit_max_wait = 1800
-        self._last_run_throttled = False
-        
+        self.debug = False
+
         self.archives_dir = Path("history/archives")
         self.archives_dir.mkdir(parents=True, exist_ok=True)
-        
+
     # ==================== Public properties ====================
     @property
     def audio_format(self) -> str:
@@ -105,36 +91,49 @@ class YoutubeMusicDownloader:
         self.__output_directory = Path(path)
         self.__output_directory.mkdir(parents=True, exist_ok=True)
 
-    # ========================= Download Functions ================================
-    def run_download(self, url: str, output_template: str, additional_args=None, show_progress: bool = True):
-        """
-        Runs a yt-dlp download with a tqdm progress bar and a stall watchdog
+    @property
+    def use_cookies(self) -> bool:
+        """Whether cookies are sent with downloads (the flag lives on the cookie service)."""
+        return self.cookies.enabled
 
-        Args:
-            url (str): The input url
-            output_template (str): _description_
-            additional_args (_type_, optional): _description_. Defaults to None.
-            show_progress (bool, optional): _description_. Defaults to True.
+    @use_cookies.setter
+    def use_cookies(self, value: bool):
+        self.cookies.enabled = bool(value)
+
+    # ========================= Download functions ================================
+    @staticmethod
+    def _result(command, output: str, throttled: bool) -> subprocess.CompletedProcess:
+        done = subprocess.CompletedProcess(args=command, returncode=0, stdout=output, stderr="")
+        done.throttled = throttled
+        return done
+
+    def run_download(self, url: str, output_template: str,
+                     additional_args=None, show_progress: bool = True):
         """
-        
+        Run one yt-dlp download with a progress bar and a stall watchdog.
+
+        Returns a CompletedProcess (with a .throttled flag) on success; raises
+        CalledProcessError (also with .throttled) on failure, and RuntimeError
+        if yt-dlp isn't installed.
+        """
         if not output_template:
-            raise ValueError("run_download function requires an output template") # If no output template is given, program fails
-        
+            raise ValueError("run_download requires an output template")
+
         output_directory = os.path.dirname(output_template)
         if output_directory:
             os.makedirs(output_directory, exist_ok=True)
-        
-        # The list is passed as a subprocess 
+
         command = [
             "yt-dlp",
             "-x",
             "-f", "bestaudio/best",
             "--audio-format", self.__audio_format,
         ]
-        
+
+        # --audio-quality only accepts 0-10 or a bitrate like 320K, not "auto"/"disable"
         if self.__audio_quality not in ("auto", "disable"):
             command += ["--audio-quality", self.__audio_quality]
-            
+
         command += [
             "-o", output_template,
             "--no-overwrites",
@@ -152,49 +151,43 @@ class YoutubeMusicDownloader:
             "--http-chunk-size", "10M",
             "--sleep-interval", str(self.yt_dlp_sleep_min),
             "--max-sleep-interval", str(self.yt_dlp_sleep_max),
-            "--quiet", "--no-warnings"          
         ]
-        
-        cookie_file = self._get_cookie_file()
+
+        if not self.debug:
+            command += ["--quiet", "--no-warnings"]
+
+        # yt-dlp rewrites its --cookies file when it exits, so concurrent
+        # workers must not share one. Each download gets a private copy, and
+        # end_run() (in the finally below) merges refreshed cookies back.
+        cookie_file = self.cookies.file_for_run()
+        run_copy = self.cookies.begin_run(cookie_file) if cookie_file else None
         if cookie_file:
-            command.extend(["--cookies", cookie_file])
-            
+            command.extend(["--cookies", str(run_copy or cookie_file)])
+
         if additional_args:
             if isinstance(additional_args, list):
                 command.extend(additional_args)
             else:
                 command.append(additional_args)
         command.append(url)
-        
-        # The progress bar for the downloader  
-        progress_bar = tqdm(
-            desc="Downloading",
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024, 
-            leave=False,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-            dynamic_ncols=True,
-        ) if show_progress else _NullBar()
-        
+
+        progress = DownloadProgress(show_progress)
         process = None
         watchdog = None
         throttled = False
-        self._last_run_throttled = False
-        
-        # Run the command as 
+
         try:
             process = subprocess.Popen(
                 command,
-                stdout = subprocess.PIPE,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
             )
-            
+
             # download_timeout is treated as "no output for N seconds" so that
             # long but healthy downloads aren't killed mid-transfer.
             def _kill(proc):
@@ -202,14 +195,13 @@ class YoutubeMusicDownloader:
                     proc.kill()
                 except Exception:
                     pass
-                
+
             def _arm():
                 t = threading.Timer(self.download_timeout, _kill, args=(process,))
                 t.daemon = True
                 t.start()
                 return t
-            
-            # The watchdog makes sure that there isn't a stall in the download
+
             watchdog = _arm()
             output_lines: List[str] = []
             try:
@@ -230,137 +222,52 @@ class YoutubeMusicDownloader:
                         throttled = True
                         self.log_manager.log_error("YouTube throttling detected")
 
-                    if "[download]" in line:
-                        try:
-                            percent_match = re.search(r'(\d+\.?\d*)%', line)
-                            if percent_match:
-                                percent = float(percent_match.group(1))
-                                progress_bar.set_description(
-                                    f"{Fore.CYAN}Downloading: {percent:.1f}%{Style.RESET_ALL}")
-
-                            size_match = re.search(r'of\s+([\d.]+\s*[KMGT]?i?B)', line)
-                            if size_match and progress_bar.total is None:
-                                total_bytes = parse_size(size_match.group(1))
-                                if total_bytes:
-                                    progress_bar.total = total_bytes
-
-                            downloaded_match = (re.search(r'([\d.]+\s*[KMGT]?i?B)\s+at', line) or
-                                                re.search(r'([\d.]+\s*[KMGT]?i?B)\s+ETA', line) or
-                                                re.search(r'([\d.]+\s*[KMGT]?i?B)\s*/', line))
-                            if downloaded_match:
-                                downloaded_bytes = parse_size(downloaded_match.group(1))
-                                if downloaded_bytes:
-                                    progress_bar.n = downloaded_bytes
-
-                            speed_match = re.search(r'at\s+([\d.]+\s*[KMGT]?i?B/s)', line)
-                            if speed_match:
-                                progress_bar.set_postfix_str(f"Speed: {speed_match.group(1)}")
-
-                            eta_match = re.search(r'ETA\s+([\d:]+)', line)
-                            if eta_match:
-                                progress_bar.set_postfix_str(f"ETA: {eta_match.group(1)}")
-
-                            progress_bar.refresh()
-                        except Exception:
-                            continue
-
-                    if "100%" in line or "already been downloaded" in line or "[Merger]" in line:
-                        if progress_bar.total and progress_bar.n < progress_bar.total:
-                            progress_bar.n = progress_bar.total
-                        progress_bar.set_description(f"{Fore.GREEN}Downloaded{Style.RESET_ALL}")
-                        progress_bar.set_postfix_str("")
-                        progress_bar.refresh()
+                    progress.update(line)
             finally:
                 if watchdog is not None:
                     watchdog.cancel()
 
             process.wait()
-            progress_bar.close()
+            progress.close()
             full_output = "\n".join(output_lines)
-            low = full_output.lower()
 
             # Checked against the whole output, since a marker that never
             # appeared on a streamed line would otherwise be missed here.
             if not throttled and looks_throttled(full_output):
                 throttled = True
-            self._last_run_throttled = throttled
 
-            # yt-dlp can report an error and still exit 0 (that is what
+            had_error = has_error_line(output_lines)
 
-            had_error_line = any(line.lstrip().upper().startswith("ERROR:")
-                                 for line in output_lines)
-            already_have = ("has already been recorded in the archive" in low
-                            or "already been downloaded" in low
-                            or "nothing to download" in low)
-
-            # Success
-            if process.returncode == 0 and not had_error_line:
-                done = subprocess.CompletedProcess(
-                    args=command, returncode=0, stdout=full_output, stderr="")
-                done.throttled = throttled
-                return done
+            if process.returncode == 0 and not had_error:
+                return self._result(command, full_output, throttled)
 
             # Archive skip / already-have-it is NOT a failure
-            if already_have and not had_error_line:
+            if already_downloaded(full_output) and not had_error:
                 self.log_manager.log_success(f"Already downloaded (skipped): {url}")
-                done = subprocess.CompletedProcess(
-                    args=command, returncode=0, stdout=full_output, stderr="")
-                done.throttled = throttled
-                return done
+                return self._result(command, full_output, throttled)
 
-            # Genuine failure - classify (specific first, catch-all keeps raw tail)
-            error_msg = f"Download failed for {url} with code {process.returncode}"
-            if process.returncode == 0 and had_error_line:
-                error_msg = (f"Download failed for {url} - yt-dlp reported an error "
-                             f"but exited 0")
-            if "403" in low or "forbidden" in low:
-                error_msg += (" - HTTP 403 (YouTube refused the stream: update yt-dlp, "
-                              "then check cookies / JS runtime)")
-            elif "429" in low or "too many requests" in low:
-                error_msg += " - HTTP 429 (rate limited, slow down or wait)"
-            elif "only images are available" in low:
-                error_msg += " - No audio stream (SABR/format restriction)"
-            elif "requested format is not available" in low:
-                error_msg += " - Requested format not available"
-            elif "javascript runtime" in low or "no supported js" in low:
-                error_msg += " - Missing JS runtime (install Deno or Node)"
-            elif "sign in" in low or "not a bot" in low or "confirm your age" in low:
-                error_msg += " - YouTube requires authentication (check cookies)"
-            elif "private video" in low:
-                error_msg += " - Video is private"
-            elif "age" in low and "restrict" in low:
-                error_msg += " - Age restricted"
-            elif "members-only" in low or "members only" in low:
-                error_msg += " - Members-only content"
-            elif "unavailable" in low or "not available in your" in low:
-                error_msg += " - Video unavailable / region-locked"
-            elif "copyright" in low:
-                error_msg += " - Copyright restriction"
-            elif "ffmpeg" in low:
-                error_msg += " - FFmpeg conversion error"
-            elif not full_output:
-                error_msg += f" - No output (likely killed after {self.download_timeout}s of inactivity)"
-            else:
-                error_msg += f" - Error: {full_output[-400:]}"
-
+            error_msg = describe_failure(url, process.returncode, full_output,
+                                         had_error, self.download_timeout)
             self.log_manager.log_failure(error_msg)
             failure = subprocess.CalledProcessError(
                 process.returncode or 1, command, output=full_output, stderr="")
+            # Ride along on the exception so a caller in another thread reads
+            # its own verdict rather than whatever a sibling thread just set.
             failure.throttled = throttled
             raise failure
 
         except FileNotFoundError:
-            progress_bar.close()
+            progress.close()
             error_msg = "yt-dlp not found. Please install it with: pip install yt-dlp"
             self.log_manager.log_error(error_msg)
             raise RuntimeError(error_msg)
         except subprocess.CalledProcessError:
             # Already classified and logged above - don't let the generic
             # handler below relabel it as an "unexpected error".
-            progress_bar.close()
+            progress.close()
             raise
         except Exception as e:
-            progress_bar.close()
+            progress.close()
             if process is not None and process.poll() is None:
                 try:
                     process.kill()
@@ -368,39 +275,80 @@ class YoutubeMusicDownloader:
                     pass
             self.log_manager.log_error(f"Unexpected error in run_download: {e}")
             raise
+        finally:
+            if run_copy is not None:
+                self.cookies.end_run(run_copy, cookie_file)
 
-    def parallel_run_download(self, tasks, archive_path: Optional[Path], max_workers: int = 3, desc: str = "Downloading", source: str = "") -> Dict[str, bool]:
+    def parallel_run_download(self, tasks, archive_path: Optional[Path],
+                              max_workers: int = 3, desc: str = "Downloading",
+                              source: str = "") -> Dict[str, bool]:
         """
-        Function that download 
+        Download many items at once.
 
-        Args:
-            tasks (_type_): _description_
-            archive_path (Optional[Path]): _description_
-            max_workers (int, optional): _description_. Defaults to 3.
-            desc (str, optional): _description_. Defaults to "Downloading".
-            source (str, optional): _description_. Defaults to "".
+        The archive is pre-filtered by the caller and appended to under a narrow
+        lock, so workers run in parallel rather than queueing on one mutex.
 
-        Returns:
-            Dict[str, bool]: _description_
+        tasks:   list of (url, output_template, additional_args, video_id, title)
+        returns: {video_id: success_bool}
+
+        Items that fail because the host was throttling go to the retry queue:
+        the link is probably fine and only the timing was wrong.
         """
-        pass
-    
-    def download_item(self, item_type: str, url_prompt: str, output_template: str = None, additional_args: list = None, confirm_large: bool = False, use_archive: bool = False, concurrent: bool = False, max_workers: int = 3) -> bool:
+        results: Dict[str, bool] = {}
+        result_lock = threading.Lock()
+        archive_lock = threading.Lock()
+        pbar_lock = threading.Lock()
+
+        with tqdm(total=len(tasks), desc=desc, unit="item", dynamic_ncols=True) as pbar:
+            def worker(url, tmpl, args, video_id, title):
+                success, error, throttled = self.retry.attempt(
+                    url, tmpl, args, "item", show_progress=False)
+                if success and archive_path is not None:
+                    self.file_helpers.append_archive(archive_path, video_id, archive_lock)
+                elif throttled:
+                    self.retry.add_failure(url, title, error, source,
+                                           throttled=True, item_type="track")
+                with result_lock:
+                    results[video_id] = success
+                with pbar_lock:
+                    pbar.update(1)
+                return success
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(worker, u, t, a, vid, ttl): vid
+                           for u, t, a, vid, ttl in tasks}
+                for future in as_completed(futures):
+                    vid = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        self.log_manager.log_error(f"Worker crashed for {vid}: {e}")
+                        with result_lock:
+                            results.setdefault(vid, False)
+
+        return results
+
+    def _tidy_output(self) -> None:
+        """Remove leftovers (thumbnails, partial files) from the output folder."""
+        cleanup_directory(self.__output_directory, self.log_manager)
+
+    def download_item(self, item_type: str, url_prompt: str, output_template=None,
+                      additional_args: list = None, confirm_large: bool = False,
+                      use_archive: bool = False, concurrent: bool = False,
+                      max_workers: int = 3) -> bool:
         """
         Unified download for tracks, albums and playlists.
-        
-        Args:
-            item_type (str): _description_
-            url_prompt (str): _description_
-            output_template (str, optional): _description_. Defaults to None.
-            additional_args (list, optional): _description_. Defaults to None.
-            confirm_large (bool, optional): _description_. Defaults to False.
-            use_archive (bool, optional): _description_. Defaults to False.
-            concurrent (bool, optional): _description_. Defaults to False.
-            max_workers (int, optional): _description_. Defaults to 3.
 
-        Returns:
-            bool: _description_
+        item_type:        "track", "album" or "playlist" (used for prompts and folders)
+        url_prompt:       what to call the URL in the prompt
+        output_template:  yt-dlp -o template, or a callable returning one. A callable
+                          is evaluated after the settings prompt, so a changed output
+                          folder is respected.
+        additional_args:  extra yt-dlp arguments for the single-call path
+        confirm_large:    ask before starting a collection of more than 50 items
+        use_archive:      keep a yt-dlp download archive for this album
+        concurrent:       expand into items and download them in parallel (playlists)
+        max_workers:      parallel downloads when concurrent=True
         """
         while True:
             Enhanced_Menu.clear_screen()
@@ -426,6 +374,7 @@ class YoutubeMusicDownloader:
                 continue
 
             self.history.add_input(url, item_type)
+            self.cookies.preflight()
 
             # Display resource information
             Enhanced_Menu.print_status("Resource information:", "success")
@@ -452,8 +401,8 @@ class YoutubeMusicDownloader:
             print()
 
             # Confirm large collections
-            if confirm_large and metadata.get('playlist_count', 0) > 50:
-                count = metadata['playlist_count']
+            count = metadata.get('playlist_count') or 0
+            if confirm_large and count > 50:
                 Enhanced_Menu.print_status(
                     f"This {item_type} contains {count} items. This may take a while.", "warning")
                 if not Enhanced_Menu.get_input("Continue with download? (y/n)", "yn", default=False):
@@ -461,7 +410,7 @@ class YoutubeMusicDownloader:
                     continue
 
             if Enhanced_Menu.get_input("Configure download settings? (y/n)", "yn", default=False):
-                self.get_user_preferences()
+                self.menu.get_user_preferences()
 
             # ---------------- Concurrent (playlist) path ----------------
             if concurrent:
@@ -469,6 +418,7 @@ class YoutubeMusicDownloader:
 
             # ---------------- Single-call (track / album) path ----------------
             else:
+                template = output_template() if callable(output_template) else output_template
                 item_args = list(additional_args) if additional_args else []
                 if item_type in ("album", "playlist"):
                     # One unavailable track shouldn't abandon the rest of the
@@ -485,11 +435,11 @@ class YoutubeMusicDownloader:
                             f"Could not extract playlist ID from {url}, archive not used")
 
                 Enhanced_Menu.print_status(f"Starting {item_type} download...", "info")
-                success, error, throttled = self._download_with_retry(
-                    url, output_template, item_args, item_type)
+                success, error, throttled = self.retry.attempt(
+                    url, template, item_args, item_type)
                 if throttled:
-                    self.retry_queue.add_failure(url, metadata.get('title', ''), error,
-                                                 "", throttled=True, item_type=item_type)
+                    self.retry.add_failure(url, metadata.get('title', ''), error,
+                                           "", throttled=True, item_type=item_type)
                     Enhanced_Menu.print_status(
                         "Throttled by YouTube - added to the retry queue so you can "
                         "pick it up later from the menu.", "warning")
@@ -504,37 +454,133 @@ class YoutubeMusicDownloader:
                 if Enhanced_Menu.get_input(f"\nDownload failed. Try another {item_type}? (y/n): ", "yn", default=True):
                     continue
                 return False
-    
+
+    def _run_playlist(self, url: str, metadata: Dict, max_workers: int) -> bool:
+        """Expand a playlist and download its items in parallel."""
+        items = Helpers.get_youtube_playlist_items(url, self.log_manager)
+        if not items:
+            Enhanced_Menu.print_status("Failed to retrieve playlist items.", "error")
+            return False
+
+        order = Enhanced_Menu.get_input(
+            "Download order: (t)op-to-bottom or (b)ottom-to-top", "str", default="t")
+        if (order or "t").lower().startswith('b'):
+            items.reverse()
+
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        playlist_id = Helpers.extract_youtube_playlist_id(url)
+        archive_path = self.archives_dir / (
+            f"{playlist_id}.txt" if playlist_id else f"playlist_{url_hash}.txt")
+
+        playlist_folder = self.__output_directory / self.file_helpers.safe_name(
+            metadata.get('title'), f"Playlist_{url_hash}")
+        playlist_folder.mkdir(parents=True, exist_ok=True)
+        collection_template = str(playlist_folder / "%(artist)s - %(title)s.%(ext)s")
+
+        done_ids = self.file_helpers.load_archive(archive_path)
+        tasks = []
+        skipped = 0
+        for item in items:
+            video_id = item.get('id')
+            if not video_id:
+                continue
+            if video_id in done_ids:
+                skipped += 1
+                continue
+            video_url = f"https://music.youtube.com/watch?v={video_id}"
+            tasks.append((video_url, collection_template, [], video_id,
+                          item.get('title') or ''))
+
+        if skipped:
+            Enhanced_Menu.print_status(f"Skipping {skipped} already-downloaded tracks", "info")
+
+        if not tasks:
+            Enhanced_Menu.print_status("Nothing new to download.", "warning")
+            return True
+
+        Enhanced_Menu.print_status(
+            f"Starting concurrent download of {len(tasks)} videos "
+            f"(max {max_workers} at a time)...", "info")
+        results = self.parallel_run_download(
+            tasks, archive_path, max_workers=max_workers, desc="Playlist Download",
+            source=url)
+
+        success_count = sum(1 for v in results.values() if v)
+        failed_count = len(results) - success_count
+
+        print("\n" + "=" * 55)
+        Enhanced_Menu.print_header("Playlist Download Complete")
+        print(f"  {Fore.GREEN}Successfully downloaded: {success_count}{Style.RESET_ALL}")
+        if skipped:
+            print(f"  {Fore.CYAN}Already had: {skipped}{Style.RESET_ALL}")
+        if failed_count:
+            print(f"  {Fore.RED}Failed: {failed_count}{Style.RESET_ALL}")
+            queued = self.retry.throttled_count()
+            if queued:
+                print(f"  {Fore.YELLOW}Throttled tracks queued for retry: {queued}{Style.RESET_ALL}")
+            print(f"{Fore.RED}  Re-run later - finished tracks will be skipped.{Style.RESET_ALL}")
+        print("=" * 55)
+
+        self._tidy_output()
+        return failed_count == 0
+
+    # ==================== Public download methods ====================
     def download_track(self):
         """Download a single track."""
-        return self._download_item(
+        return self.download_item(
             item_type="track",
             url_prompt="track URL",
-            output_template=str(self.__output_directory / "%(artist)s - %(title)s.%(ext)s"),
+            output_template=lambda: str(self.__output_directory / "%(artist)s - %(title)s.%(ext)s"),
             confirm_large=False,
         )
 
     def download_album(self):
         """Download an album."""
-        return self._download_item(
+        return self.download_item(
             item_type="album",
             url_prompt="album URL",
-            output_template=str(self.__output_directory /
-                                "%(artist)s/%(album)s/%(artist)s - %(title)s.%(ext)s"),
+            output_template=lambda: str(self.__output_directory /
+                                        "%(artist)s/%(album)s/%(artist)s - %(title)s.%(ext)s"),
             confirm_large=True,
             use_archive=True,
         )
 
     def download_playlist(self):
         """Download a playlist with concurrent downloads."""
-        return self._download_item(
+        return self.download_item(
             item_type="playlist",
             url_prompt="playlist URL",
             output_template=None,        # computed per-playlist inside
             confirm_large=True,
             concurrent=True,
-            max_workers=self.max_concurrent or 3,
+            max_workers=self.max_concurrency or 3,
         )
+
+    def search_and_download(self):
+        """Search for a song and download it."""
+        Enhanced_Menu.clear_screen()
+        Enhanced_Menu.print_header("SEARCH & DOWNLOAD")
+        song_query = Enhanced_Menu.get_input(
+            "What is the name of the song you're looking for: ", "str")
+        song_query = (song_query or "").strip()
+        if not song_query:
+            Enhanced_Menu.print_status("No search query provided", "error")
+            return False
+
+        self.history.add_input(song_query, "search")
+        self.cookies.preflight()
+        if Enhanced_Menu.get_input("Configure download settings? (y/n)", "yn", default=False):
+            self.menu.get_user_preferences()
+
+        Enhanced_Menu.print_status("Searching for the song. Browsing through YouTube...", "info")
+        output_template = str(self.__output_directory / "Searches" /
+                              "%(artist)s - %(title)s.%(ext)s")
+
+        ok, _error, _throttled = self.retry.attempt(
+            f"ytsearch1:{song_query}", output_template, item_type="search")
+        if ok:
+            self.log_manager.log_success(f"Successfully downloaded: '{song_query}'")
+        return ok
 
     def download_from_file(self, file_path: str = None) -> bool:
         """
@@ -608,6 +654,10 @@ class YoutubeMusicDownloader:
 
         self.history.add_input(str(path), "batch")
 
+        # Settings first, so a changed output folder applies to the folder chosen below.
+        if Enhanced_Menu.get_input("Configure download settings? (y/n)", "yn", default=False):
+            self.menu.get_user_preferences()
+
         # Output folder: named after the file by default, so a batch stays together.
         folder_name = self.file_helpers.safe_name(path.stem, "Batch")
         if Enhanced_Menu.get_input(f"Save into a subfolder named '{folder_name}'? (y/n)",
@@ -618,18 +668,16 @@ class YoutubeMusicDownloader:
         target.mkdir(parents=True, exist_ok=True)
         output_template = str(target / "%(artist)s - %(title)s.%(ext)s")
 
-        if Enhanced_Menu.get_input("Configure download settings? (y/n)", "yn", default=False):
-            self.get_user_preferences()
-
         total = len(valid)
         succeeded = failed = 0
         pending: Dict[str, str] = {}          # url -> status, not yet flushed to file
         cleared: List[str] = []               # urls to remove from the retry queue
         failures: List[Tuple[str, str, str]] = []
         interrupted = throttled_out = False
-        rate_limit_streak = 0
+        streak = 0
         started = time.monotonic()
 
+        self.cookies.preflight()
         Enhanced_Menu.print_status(f"Starting batch download of {total} links...", "info")
         print()
 
@@ -639,26 +687,26 @@ class YoutubeMusicDownloader:
                 label = title or url
                 print(f"{Fore.CYAN}[{index}/{total}]{Style.RESET_ALL} {str(label)[:65]}")
 
-                ok, error, throttled = self._download_with_retry(
+                ok, error, throttled = self.retry.attempt(
                     url, output_template, item_type="track", show_progress=False)
 
                 if ok:
                     succeeded += 1
                     pending[url] = "success"
                     cleared.append(url)
-                    rate_limit_streak = 0
+                    streak = 0
                     print(f"      {Fore.GREEN}done{Style.RESET_ALL}")
                 else:
                     failed += 1
                     pending[url] = "failed"
                     failures.append((url, title, error))
-                    self.retry_queue.add_failure(url, title, error, str(path),
-                                                 throttled=throttled, item_type="track")
+                    self.retry.add_failure(url, title, error, str(path),
+                                           throttled=throttled, item_type="track")
                     if throttled:
-                        rate_limit_streak += 1
+                        streak += 1
                         print(f"      {Fore.RED}throttled (403/429) -> retry queue{Style.RESET_ALL}")
                     else:
-                        rate_limit_streak = 0
+                        streak = 0
                         print(f"      {Fore.RED}failed -> retry queue{Style.RESET_ALL}")
 
                 # Written per link rather than in batches: the file should say
@@ -670,7 +718,7 @@ class YoutubeMusicDownloader:
                 # Once YouTube starts refusing, every remaining link fails the
                 # same way and burns max_retries doing it. Stop instead: the
                 # markers already written make the re-run pick up here.
-                if rate_limit_streak >= 3:
+                if self.retry.should_stop(streak):
                     throttled_out = True
                     Enhanced_Menu.print_status(
                         "Three throttled links in a row - stopping here. Wait a while, "
@@ -678,15 +726,7 @@ class YoutubeMusicDownloader:
                     break
 
                 if index < total:
-                    if rate_limit_streak:
-                        wait = self._backoff_seconds(rate_limit_streak)
-                        Enhanced_Menu.print_status(
-                            f"Throttled - waiting {wait:.0f}s before the next link", "warning")
-                        time.sleep(wait)      # Ctrl-C is caught by the handler below
-                    else:
-                        # yt-dlp's own --sleep-interval only applies within a
-                        # single invocation, not between them.
-                        time.sleep(random.uniform(self.yt_dlp_sleep_min, self.yt_dlp_sleep_max))
+                    self.retry.pause_between(streak)
 
         except KeyboardInterrupt:
             interrupted = True
@@ -697,7 +737,7 @@ class YoutubeMusicDownloader:
 
         # Final flush of statuses, and drop anything that succeeded from the queue.
         self.batch_file.mark_statuses(path, pending)
-        self.retry_queue.clear(cleared)
+        self.retry.clear(cleared)
 
         elapsed = time.monotonic() - started
         stopped = interrupted or throttled_out
@@ -711,127 +751,13 @@ class YoutubeMusicDownloader:
                 print(f"      {Fore.RED}- {str(title or url)[:60]}{Style.RESET_ALL}")
             if len(failures) > 10:
                 print(f"      {Fore.RED}...and {len(failures) - 10} more{Style.RESET_ALL}")
-            print(f"  {Fore.YELLOW}Queued for retry in:{Style.RESET_ALL} {self.retry_queue.path}")
+            print(f"  {Fore.YELLOW}Queued for retry in:{Style.RESET_ALL} {self.retry.path}")
         if stopped:
             print(f"  {Fore.YELLOW}Not attempted:{Style.RESET_ALL} {total - succeeded - failed}")
         print(f"  {Fore.CYAN}Statuses written to:{Style.RESET_ALL} {path}")
         print(f"  {Fore.CYAN}Elapsed:{Style.RESET_ALL} {elapsed / 60:.1f} min")
 
         if succeeded:
-            Helpers.cleanup_directory(self.__output_directory, self.log_manager)
+            self._tidy_output()
 
         return failed == 0 and not stopped
-
-    def download_from_retry_queue(self) -> bool:
-        """Re-attempt every link sitting in the retry queue."""
-        Enhanced_Menu.clear_screen()
-        Enhanced_Menu.print_header("Retry Queue", "Re-attempt previously failed links")
-
-        queue = self.retry_queue.read()
-        if not queue:
-            Enhanced_Menu.print_status("The retry queue is empty.", "info")
-            return True
-
-        # Throttled links first: they are the ones most likely to work now.
-        items = sorted(queue.values(),
-                       key=lambda e: (not e.get("throttled"), int(e.get("attempts", 0))))
-        throttled_total = sum(1 for e in items if e.get("throttled"))
-
-        print(f"  {Fore.CYAN}Queued links:{Style.RESET_ALL} {len(items)}")
-        if throttled_total:
-            print(f"  {Fore.YELLOW}Last failed to throttling:{Style.RESET_ALL} {throttled_total} "
-                  f"{Style.DIM}(likely to work now){Style.RESET_ALL}")
-        for entry in items[:10]:
-            tag = f"{Fore.YELLOW} [throttled]{Style.RESET_ALL}" if entry.get("throttled") else ""
-            print(f"      - {str(entry.get('title') or entry['url'])[:55]} "
-                  f"{Style.DIM}({entry.get('attempts', 0)} attempts){Style.RESET_ALL}{tag}")
-        if len(items) > 10:
-            print(f"      ...and {len(items) - 10} more")
-        print()
-
-        if not Enhanced_Menu.get_input(f"Retry these {len(items)} links? (y/n)",
-                                       "yn", default=True):
-            Enhanced_Menu.print_status("Cancelled", "info")
-            return False
-
-        target = self.__output_directory / "Retries"
-        target.mkdir(parents=True, exist_ok=True)
-        # An album queued as a whole still wants its artist/album folders.
-        templates = {
-            "album": str(target / "%(artist)s/%(album)s/%(artist)s - %(title)s.%(ext)s"),
-            "playlist": str(target / "%(playlist)s/%(artist)s - %(title)s.%(ext)s"),
-        }
-        default_template = str(target / "%(artist)s - %(title)s.%(ext)s")
-
-        succeeded = failed = 0
-        per_source: Dict[str, Dict[str, str]] = {}
-        cleared: List[str] = []
-        rate_limit_streak = 0
-        total = len(items)
-
-        try:
-            for index, entry in enumerate(items, 1):
-                url = entry["url"]
-                label = entry.get("title") or url
-                print(f"{Fore.CYAN}[{index}/{total}]{Style.RESET_ALL} {str(label)[:65]}")
-
-                item_type = entry.get("item_type", "track")
-                ok, error, throttled = self._download_with_retry(
-                    url, templates.get(item_type, default_template),
-                    item_type=item_type, show_progress=False)
-
-                source = entry.get("source")
-                if ok:
-                    succeeded += 1
-                    cleared.append(url)
-                    rate_limit_streak = 0
-                    if source:
-                        per_source.setdefault(source, {})[url] = "success"
-                    print(f"      {Fore.GREEN}done{Style.RESET_ALL}")
-                else:
-                    failed += 1
-                    self.retry_queue.add_failure(url, entry.get("title", ""), error,
-                                                 source or "", throttled=throttled,
-                                                 item_type=item_type)
-                    if throttled:
-                        rate_limit_streak += 1
-                        print(f"      {Fore.RED}still throttled{Style.RESET_ALL}")
-                    else:
-                        rate_limit_streak = 0
-                        print(f"      {Fore.RED}still failing{Style.RESET_ALL}")
-
-                # Draining the queue into a still-throttled host just re-queues
-                # everything with a higher attempt count. Stop and come back.
-                if rate_limit_streak >= 3:
-                    Enhanced_Menu.print_status(
-                        "Still being throttled - stopping. The rest stay queued.", "warning")
-                    break
-
-                if index < total:
-                    if rate_limit_streak:
-                        wait = self._backoff_seconds(rate_limit_streak)
-                        Enhanced_Menu.print_status(
-                            f"Throttled - waiting {wait:.0f}s before the next link", "warning")
-                        time.sleep(wait)
-                    else:
-                        time.sleep(random.uniform(self.yt_dlp_sleep_min, self.yt_dlp_sleep_max))
-        except KeyboardInterrupt:
-            print()
-            Enhanced_Menu.print_status("Interrupted - remaining links stay queued.", "warning")
-
-        self.retry_queue.clear(cleared)
-        # Mirror the successes back into whichever file each link came from.
-        for source, statuses in per_source.items():
-            source_path = Path(source)
-            if source_path.is_file():
-                self.batch_file.mark_statuses(source_path, statuses)
-
-        print()
-        Enhanced_Menu.print_header("Retry Complete")
-        print(f"  {Fore.GREEN}Recovered:{Style.RESET_ALL} {succeeded}")
-        if failed:
-            print(f"  {Fore.RED}Still queued:{Style.RESET_ALL} {failed}")
-
-        if succeeded:
-            Helpers.cleanup_directory(self.__output_directory, self.log_manager)
-        return failed == 0
