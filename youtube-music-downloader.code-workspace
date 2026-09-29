@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../youtube-music-downloader"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../harmoni"
+		}
+	],
+	"settings": {}
+}
