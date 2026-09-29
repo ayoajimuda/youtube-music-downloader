@@ -1,13 +1,7 @@
 {
 	"folders": [
 		{
-			"path": "../youtube-music-downloader"
-		},
-		{
-			"path": "."
-		},
-		{
-			"path": "../harmoni"
+			"path": "../youtube-music-downloader-base"
 		}
 	],
 	"settings": {}
