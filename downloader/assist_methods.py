@@ -1,3 +1,5 @@
+"""Assist methods for the Youtube Music Downloader"""
+
 import os
 import re
 import spotipy

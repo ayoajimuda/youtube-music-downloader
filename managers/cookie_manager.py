@@ -1,18 +1,4 @@
-"""Cookie management for authentication.
-
-Module-level: import it and call the functions directly, or assign the module
-to an attribute (self.cookies = cookie_manager) so existing call sites keep
-working.
-
-  - get_status()        check which browsers have YouTube cookies
-  - extract_cookies()   pull them out of a browser into a cookies.txt
-  - load_cookies()      point at an existing file and make it active
-  - save_cookies()      keep a timestamped copy
-  - list_cookies()      what's in the cookie folder
-  - clear_cookies()     delete them
-  - test_cookies()      check the active file still works
-  - interactive_menu()  all of the above, from the menu
-"""
+"""Cookie management for authentication."""
 
 import os
 import platform
