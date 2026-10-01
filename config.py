@@ -22,16 +22,7 @@ DEFAULT_CONFIG = {
     "tracks_file": "data/tracks.json",
     "playlists_file": "data/playlists.json",
 
-    "output_dir": "music",
-    "audio_format": "mp3",
-    "sleep_between": 5,
-    "average_download_time": 20,
-    "retry_attempts": 3,
-    "retry_delay": 5,
-    "auto_cleanup": False,
-    "auto_backup": True,
-    "max_backups": 10,
-    "profile": "light",
+
     "exportify_watch_folder": "data/exportify",
     "ffmpeg_path": "",
     "ytdlp_path": "",

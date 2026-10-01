@@ -48,7 +48,6 @@ def config_menu(config: dict) -> dict:
     
     return config
 
-
 def view_config(config: dict):
     """Display the current configuration in a readable format."""
     print("\n" + "=" * 50)
@@ -76,7 +75,6 @@ def view_config(config: dict):
     
     print("\n" + "=" * 50)
     input("\nPress Enter to continue...")
-
 
 def update_setting_menu(config: dict) -> dict:
     """Menu to update individual settings."""
@@ -144,7 +142,6 @@ def update_setting_menu(config: dict) -> dict:
     
     return config
 
-
 def switch_profile_menu(config: dict) -> dict:
     """Menu to switch between configuration profiles."""
     profiles = list_profiles()
@@ -186,7 +183,6 @@ def switch_profile_menu(config: dict) -> dict:
     
     return config
 
-
 def toggle_automation_menu(config: dict) -> dict:
     """Menu to toggle automation features on/off."""
     automation_settings = [
@@ -227,7 +223,6 @@ def toggle_automation_menu(config: dict) -> dict:
     
     return config
 
-
 def reset_config_menu(config: dict) -> dict:
     """Menu to reset configuration to defaults."""
     confirm = questionary.confirm(
@@ -245,7 +240,6 @@ def reset_config_menu(config: dict) -> dict:
             log_error(message)
     
     return config
-
 
 def validate_config_menu(config: dict):
     """Validate the current configuration and show any errors."""
