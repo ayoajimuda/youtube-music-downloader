@@ -1,5 +1,5 @@
 import json
-from utils.logger import log_info, log_error
+from log_manager import log_info, log_error
 from constants import PROGRESS_FILE
 
 def save_progress(pending_tracks):

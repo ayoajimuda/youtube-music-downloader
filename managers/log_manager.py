@@ -30,6 +30,13 @@ DOWNLOAD_LOGS = {
 TEXT_LOGS = {
     "error": LOG_DIR / "error.log",       # errors during downloading
     "warning": LOG_DIR / "warning.log",   # warnings
+    "info": LOG_DIR / "info.log",
+}
+
+TEXT_LEVELS = {
+    "error": logging.ERROR,
+    "warning": logging.WARNING,
+    "info": logging.INFO,
 }
 
 LOG_PATHS = {**DOWNLOAD_LOGS, **TEXT_LOGS}
@@ -48,6 +55,7 @@ COLOR_MAP = {
     "failed": Fore.RED,
     "error": Fore.YELLOW,
     "warning": Fore.MAGENTA,
+    "info": Fore.CYAN,
 }
 
 _lock = threading.RLock()     # reentrant: _emit and the JSON writers nest
@@ -202,15 +210,11 @@ def read_downloads(kind: str = "success", limit: Optional[int] = None) -> List[d
 
 # ==================== Diagnostics (plain text) ====================
 def _log_text(kind: str, message: str, url: str, console: bool, **kwargs) -> None:
-    """A line in error.log or warning.log: the message, then the link it hit."""
+    """A line in error.log, warning.log or info.log: the message, then the link it hit."""
     setup()
     line = f"{message} | {url}" if url else message
     with _lock:
-        logger = _loggers[kind]
-        if kind == "error":
-            logger.error(line, **kwargs)
-        else:
-            logger.warning(line)
+        _loggers[kind].log(TEXT_LEVELS[kind], line, **kwargs)
         if console and _console_logger:
             _console_logger.info(f"{COLOR_MAP[kind]}{message}{Style.RESET_ALL}")
 
@@ -221,6 +225,10 @@ def log_error(message: str, exc_info=False, url: str = "", console: bool = True)
 def log_warning(message: str, url: str = "", console: bool = True) -> None:
     """Log something recoverable the user should still see (throttling, retries)."""
     _log_text("warning", message, url, console)
+
+def log_info(message: str, url: str = "", console: bool = True) -> None:
+    """Log routine progress worth keeping (settings saved, batch resumed, files cleaned up)."""
+    _log_text("info", message, url, console)
 
 def read_text_log(kind: str = "error", limit: int = 25) -> List[str]:
     """The last lines of a text log, oldest first."""
