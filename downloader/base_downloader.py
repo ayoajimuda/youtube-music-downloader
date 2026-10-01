@@ -385,7 +385,6 @@ class YoutubeMusicDownloader:
         """
         pass
     
-    
     def _retry_logic(self, url: str, output_template: str, additional_args: list = None,
                              item_type: str = "item", show_progress: bool = True) -> Tuple[bool, str, bool]:
         """
