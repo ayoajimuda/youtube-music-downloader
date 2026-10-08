@@ -11,7 +11,6 @@ SYSTEM_DEPENDENCIES = [
 ]
 
 # Audio Related
-
 VALID_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
 
 AUDIO_BITRATE_OPTIONS = {
@@ -23,9 +22,10 @@ AUDIO_BITRATE_OPTIONS = {
     "320k": "Best quality (larger file size)"
 }
 
+# Output Related
+DOWNLOAD_DIRECTORY = "C:/Users/Ayomide/Music/Collection/YouTube"
 
 # Files
-
 FAILED_FILE = "data/failed_downloads.json"
 PROGRESS_FILE = "data/download_progress.json"
 LOG_FILE = "app.log"
