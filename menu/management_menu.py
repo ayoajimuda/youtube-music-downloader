@@ -12,7 +12,6 @@ def management_menu(config):
             "Retry failed downloads",
             "Detect duplicates",
             "Organize files by artist/album",
-            "Embed metadata in MP3s",
             "Back"
         ]
     ).ask()
