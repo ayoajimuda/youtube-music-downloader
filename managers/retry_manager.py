@@ -1,25 +1,26 @@
 """Retry the downloads recorded in failed_downloads.json.
 
-Module-level, like the config and rate limiter modules: call configure() once
-at startup, then run() whenever the user picks "retry failed downloads".
+Module-level: call configure() once at startup (main_menu.build_downloader does),
+then run() whenever the user picks "retry failed downloads".
 
-The project's other modules are passed in rather than imported, so file and
-package names don't matter:
+How a run works:
+  - Links are tried most-promising first: ones that failed to throttling, then
+    the ones with the fewest failed runs, oldest first.
+  - Each link gets up to `max_retries` attempts (from Settings), waiting
+    `retry_delay`, then twice that, and so on between them. A throttled link,
+    a bot check or a permanent error ("Video is private") stops early, since
+    trying again straight away won't help.
+  - Links that keep failing are skipped after `give_up_after` failed runs, and
+    permanent errors are skipped altogether (both can be forced with flags).
+  - Three throttled links in a row, or a bot check, ends the run; the rest stay
+    queued. Successes leave the queue, and are marked done in the batch file
+    they came from.
 
-    downloader  a YoutubeMusicDownloader (uses run_download, output_directory,
-                yt_dlp_sleep_min/max, rate_limit_backoff, rate_limit_max_wait)
-    log         the logging module (read_failures, record_failure, log_success,
-                and clear_failures if present)
-    batch_file  optional: successes are written back into the file each link
-                came from, so re-running that file skips them
-    limiter     optional: the rate limiter module (acquire, penalize)
-
-Usage:
-    import retry_manager
-    retry_manager.configure(downloader, log_manager, batch_file, rate_limiter)
-    summary = retry_manager.run()
+Older code written for the Spotify project can keep calling retry_failed(),
+add_failed_track(), clear_failed_tracks() and get_failed_count().
 """
 
+import json
 import random
 import subprocess
 import threading
@@ -43,6 +44,10 @@ PERMANENT_MARKERS = (
 # Waiting doesn't clear a bot check; only fresh cookies do. Stop the run.
 BOT_CHECK_MARKERS = ("sign in to confirm", "not a bot", "requires authentication")
 
+# Artist/title entries (from the old Spotify-era queue) are retried as a YouTube
+# search for "<artist> - <title>"; yt-dlp downloads the top result.
+SEARCH_PREFIX = "ytsearch1:"
+
 _STOP_MESSAGES = {
     "cancelled": "Cancelled.",
     "throttled": "Still being throttled - stopped. Try again later; the rest stay queued.",
@@ -59,9 +64,9 @@ _state: Dict[str, Any] = {
     "log": None,
     "batch_file": None,
     "limiter": None,
-    # Non-throttled attempts after which a link is written off. Throttled
-    # attempts don't count: they were about the host, not the link.
-    "max_attempts": 5,
+    # Failed runs after which a link is skipped. Throttled runs don't count:
+    # they were about the host, not the link.
+    "give_up_after": 5,
     "max_throttle_streak": 3,
     "output_subfolder": "Retries",
     "show_progress": False,
@@ -86,24 +91,40 @@ class RetrySummary:
 
 # ==================== Setup ====================
 def configure(downloader, log, batch_file=None, limiter=None, *,
-              max_attempts: int = 5, max_throttle_streak: int = 3,
-              output_subfolder: str = "Retries", show_progress: bool = False) -> None:
-    """Hand the module the pieces it works with. Call once at startup."""
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be at least 1")
+              give_up_after: int = 5, max_throttle_streak: int = 3,
+              output_subfolder: str = "Retries", show_progress: bool = False,
+              max_attempts: Optional[int] = None) -> None:
+    """
+    Hand the module the pieces it works with. Call once at startup.
+
+    downloader  the YoutubeMusicDownloader (run_download, output_directory,
+                max_retries, retry_delay, yt_dlp_sleep_min/max, rate_limit_*)
+    log         managers.log_manager
+    batch_file  downloader.batch_downloader (optional)
+    limiter     downloader.rate_limiter (optional)
+
+    max_attempts is the old name for give_up_after.
+    """
+    give_up_after = max_attempts if max_attempts is not None else give_up_after
+    if give_up_after < 1:
+        raise ValueError("give_up_after must be at least 1")
     if max_throttle_streak < 1:
         raise ValueError("max_throttle_streak must be at least 1")
     _state.update(downloader=downloader, log=log, batch_file=batch_file,
-                  limiter=limiter, max_attempts=max_attempts,
+                  limiter=limiter, give_up_after=give_up_after,
                   max_throttle_streak=max_throttle_streak,
                   output_subfolder=output_subfolder, show_progress=show_progress)
 
 
+def is_configured() -> bool:
+    return _state["downloader"] is not None and _state["log"] is not None
+
+
 def _require() -> Tuple[Any, Any]:
-    downloader, log = _state["downloader"], _state["log"]
-    if downloader is None or log is None:
-        raise RuntimeError("retry_manager.configure(downloader, log) must be called first")
-    return downloader, log
+    if not is_configured():
+        raise RuntimeError("retry_manager.configure(downloader, log) must be called first "
+                           "(main_menu.build_downloader() does this at startup)")
+    return _state["downloader"], _state["log"]
 
 
 def _contains(text: str, markers) -> bool:
@@ -111,9 +132,72 @@ def _contains(text: str, markers) -> bool:
     return any(m in low for m in markers)
 
 
+# ==================== Old queue entries ====================
+def search_url(artist: str, track: str) -> str:
+    """A yt-dlp search 'URL' for an artist/title pair."""
+    query = " - ".join(part.strip() for part in (artist or "", track or "") if part.strip())
+    return f"{SEARCH_PREFIX}{query}"
+
+
+def _legacy_items(data) -> List[dict]:
+    items = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    return [e for e in items if isinstance(e, dict) and not e.get("url")
+            and (e.get("track") or e.get("title"))]
+
+
+def import_legacy_failures(path=None) -> int:
+    """
+    Convert artist/title entries (the old Spotify-project format, with no link)
+    into searchable entries in the current queue. Returns how many were added.
+
+    With no path, converts any such entries already in failed_downloads.json,
+    which the log manager would otherwise skip and then drop on its next write.
+    """
+    _, log = _require()
+    path = Path(path) if path else Path(log.FAILED_FILE)
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        data = json.loads(text) if text else []
+    except (OSError, ValueError):
+        return 0
+    legacy = _legacy_items(data)
+    if not legacy:
+        return 0
+
+    with log._lock:
+        records = log.read_failures()
+        added = 0
+        for old in legacy:
+            artist = str(old.get("artist") or "")
+            track = str(old.get("track") or old.get("title") or "")
+            url = search_url(artist, track)
+            if url == SEARCH_PREFIX or url in records:
+                continue
+            attempts = int(old.get("attempt_count", 0) or 0)
+            records[url] = {
+                "url": url,
+                "title": f"{artist} - {track}" if artist else track,
+                "source": "", "item_type": "track",
+                "attempt_count": attempts, "throttled_attempts": 0, "throttled": False,
+                "first_failed": old.get("first_failed", ""),
+                "last_failed": old.get("last_failed", ""),
+                "last_error": str(old.get("last_error") or "")[:300],
+                "metadata": {"artist": artist, "title": track} if artist else {"title": track},
+            }
+            added += 1
+        if added:
+            log._write_failures(records)
+    if added:
+        print(f"{Fore.CYAN}Converted {added} older artist/title entr"
+              f"{'y' if added == 1 else 'ies'} into YouTube searches.{Style.RESET_ALL}")
+    return added
+
+
 # ==================== Selection ====================
 def real_attempts(entry: dict) -> int:
-    """Attempts that failed for reasons other than throttling."""
+    """Failed runs that weren't caused by throttling."""
     total = int(entry.get("attempt_count", entry.get("attempts", 0)) or 0)
     throttled = int(entry.get("throttled_attempts", 0) or 0)
     return max(0, total - throttled)
@@ -128,22 +212,21 @@ def pending(include_permanent: bool = False,
             include_exhausted: bool = False) -> Tuple[List[dict], List[dict], List[dict]]:
     """(to_retry, permanent, exhausted). to_retry is sorted most-promising first."""
     _, log = _require()
+    import_legacy_failures()
     queue, permanent, exhausted = [], [], []
     for entry in log.read_failures().values():
         if not include_permanent and is_permanent(entry):
             permanent.append(entry)
-        elif not include_exhausted and real_attempts(entry) >= _state["max_attempts"]:
+        elif not include_exhausted and real_attempts(entry) >= _state["give_up_after"]:
             exhausted.append(entry)
         else:
             queue.append(entry)
-    # Throttled links first (most likely to work now), then fewest real
-    # attempts, then the ones that failed longest ago.
     queue.sort(key=lambda e: (not e.get("throttled"), real_attempts(e),
                               e.get("last_failed", "")))
     return queue, permanent, exhausted
 
 
-# ==================== One attempt ====================
+# ==================== Attempts ====================
 def _template(item_type: str) -> str:
     downloader, _ = _require()
     root = Path(downloader.output_directory) / _state["output_subfolder"]
@@ -155,7 +238,7 @@ def _template(item_type: str) -> str:
 
 
 def _attempt(entry: dict) -> Tuple[bool, str, bool]:
-    """(success, error, throttled). One yt-dlp run; this module owns the retries."""
+    """(success, error, throttled) for one yt-dlp run."""
     downloader, _ = _require()
     item_type = entry.get("item_type") or "track"
     args = ["--ignore-errors"] if item_type in ("album", "playlist") else []
@@ -176,6 +259,36 @@ def _attempt(entry: dict) -> Tuple[bool, str, bool]:
         raise                       # yt-dlp is missing; no point continuing
     except Exception as error:      # anything else: record it, keep going
         return False, str(error)[:300], False
+
+
+def _retry_settings() -> Tuple[int, float, float]:
+    """(attempts per link, first delay, longest delay), from the downloader's settings."""
+    downloader, _ = _require()
+    attempts = max(1, int(getattr(downloader, "max_retries", 1) or 1))
+    delay = max(0.0, float(getattr(downloader, "retry_delay", 0) or 0))
+    cap = float(getattr(downloader, "rate_limit_max_wait", 1800) or 1800)
+    return attempts, delay, cap
+
+
+def _try_link(entry: dict) -> Tuple[bool, str, bool]:
+    """Up to max_retries attempts with exponential backoff. (success, error, throttled)."""
+    attempts, delay, cap = _retry_settings()
+    error, throttled = "", False
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            wait = min(cap, delay * 2 ** (attempt - 2))
+            print(f"      {Style.DIM}attempt {attempt}/{attempts}"
+                  f"{f' in {wait:.0f}s' if wait else ''}{Style.RESET_ALL}")
+            if wait:
+                time.sleep(wait)
+        ok, error, throttled = _attempt(entry)
+        if ok:
+            return True, "", False
+        # Trying again straight away won't help with any of these.
+        if throttled or _contains(error, BOT_CHECK_MARKERS) or \
+                _contains(error, PERMANENT_MARKERS):
+            break
+    return False, error, throttled
 
 
 # ==================== Pacing ====================
@@ -213,7 +326,6 @@ def _clear(urls: List[str]) -> None:
     if clear:
         clear(urls)
         return
-    # Older logger without clear_failures: same read-modify-write, same lock.
     with log._lock:
         records = log.read_failures()
         for url in urls:
@@ -233,10 +345,19 @@ def _mirror_to_sources(per_source: Dict[str, Dict[str, str]]) -> None:
 
 
 # ==================== Output ====================
+def _name(entry: dict) -> str:
+    title = entry.get("title") or entry["url"]
+    return title[len(SEARCH_PREFIX):] if title.startswith(SEARCH_PREFIX) else title
+
+
 def _print_plan(queue, permanent, exhausted) -> None:
+    attempts, delay, _ = _retry_settings()
     print(f"\n{Fore.CYAN}Failed downloads on record:{Style.RESET_ALL} "
           f"{len(queue) + len(permanent) + len(exhausted)}")
-    print(f"  {Fore.GREEN}To retry:{Style.RESET_ALL} {len(queue)}")
+    print(f"  {Fore.GREEN}To retry:{Style.RESET_ALL} {len(queue)}  "
+          f"{Style.DIM}(up to {attempts} attempt{'s' if attempts != 1 else ''} each"
+          f"{f', {delay:.0f}s apart and doubling' if attempts > 1 and delay else ''})"
+          f"{Style.RESET_ALL}")
     throttled = sum(1 for e in queue if e.get("throttled"))
     if throttled:
         print(f"    {Fore.YELLOW}{throttled} last failed to throttling "
@@ -244,12 +365,14 @@ def _print_plan(queue, permanent, exhausted) -> None:
     if permanent:
         print(f"  {Fore.RED}Skipped, permanent error:{Style.RESET_ALL} {len(permanent)}")
     if exhausted:
-        print(f"  {Fore.RED}Skipped, {_state['max_attempts']}+ failed attempts:"
+        print(f"  {Fore.RED}Skipped, failed {_state['give_up_after']}+ times:"
               f"{Style.RESET_ALL} {len(exhausted)}")
     for entry in queue[:10]:
         tag = f"{Fore.YELLOW} [throttled]{Style.RESET_ALL}" if entry.get("throttled") else ""
-        print(f"      - {str(entry.get('title') or entry['url'])[:55]} "
-              f"{Style.DIM}({real_attempts(entry)} attempts){Style.RESET_ALL}{tag}")
+        search = f"{Style.DIM} [search]{Style.RESET_ALL}" if \
+            entry["url"].startswith(SEARCH_PREFIX) else ""
+        print(f"      - {_name(entry)[:55]} "
+              f"{Style.DIM}(failed {real_attempts(entry)}x){Style.RESET_ALL}{tag}{search}")
     if len(queue) > 10:
         print(f"      ...and {len(queue) - 10} more")
     print()
@@ -275,7 +398,7 @@ def run(include_permanent: bool = False, include_exhausted: bool = False,
     Retry every eligible link in failed_downloads.json, one at a time.
 
     include_permanent  also retry private/removed/copyright failures
-    include_exhausted  also retry links past max_attempts
+    include_exhausted  also retry links that have failed give_up_after times
     limit              retry at most this many links this run
     dry_run            print the plan, download nothing
     confirm            called with a question before starting; False cancels
@@ -316,9 +439,9 @@ def _run(log, include_permanent, include_exhausted, limit, dry_run, confirm) -> 
             url = entry["url"]
             title = entry.get("title", "")
             item_type = entry.get("item_type") or "track"
-            print(f"{Fore.CYAN}[{index}/{total}]{Style.RESET_ALL} {str(title or url)[:65]}")
+            print(f"{Fore.CYAN}[{index}/{total}]{Style.RESET_ALL} {_name(entry)[:65]}")
 
-            ok, error, throttled = _attempt(entry)
+            ok, error, throttled = _try_link(entry)
 
             if ok:
                 streak = 0
@@ -326,7 +449,7 @@ def _run(log, include_permanent, include_exhausted, limit, dry_run, confirm) -> 
                 recovered_urls.append(url)
                 if entry.get("source"):
                     per_source.setdefault(entry["source"], {})[url] = "success"
-                log.log_success(f"Recovered on retry: {title or url}", url=url,
+                log.log_success(f"Recovered on retry: {_name(entry)}", url=url,
                                 metadata=entry.get("metadata"),
                                 item_type=item_type, console=False)
                 print(f"      {Fore.GREEN}done{Style.RESET_ALL}")
@@ -361,4 +484,46 @@ def _run(log, include_permanent, include_exhausted, limit, dry_run, confirm) -> 
     tried = set(summary.recovered) | set(summary.still_failing)
     summary.not_attempted = [e["url"] for e in queue if e["url"] not in tried]
     _print_summary(summary)
+    if hasattr(log, "log_info"):
+        stopped = f", stopped ({summary.stopped_reason})" if summary.stopped_reason else ""
+        log.log_info(f"Retry run: {len(summary.recovered)} recovered, "
+                     f"{len(summary.still_failing)} still failing{stopped}", console=False)
     return summary
+
+
+# ==================== Spotify-project names ====================
+def retry_failed(config=None) -> RetrySummary:
+    """
+    Old entry point. The config argument is accepted and ignored: attempts and
+    delays now come from the downloader's settings (Settings menu).
+    """
+    return run()
+
+
+def add_failed_track(artist: str, track: str, error: Optional[str] = None,
+                     config=None, url: str = "") -> dict:
+    """Queue a failed track. Without a link, it's retried as a YouTube search."""
+    _, log = _require()
+    title = f"{artist} - {track}" if artist else track
+    return log.record_failure(url or search_url(artist, track), title, error or "",
+                              item_type="track",
+                              metadata={"artist": artist, "title": track})
+
+
+def clear_failed_tracks() -> None:
+    """Empty the retry queue."""
+    _, log = _require()
+    if hasattr(log, "clear_log"):
+        log.clear_log("retry_queue")
+    else:
+        with log._lock:
+            log._write_failures({})
+    if hasattr(log, "log_info"):
+        log.log_info("Cleared failed downloads list.")
+
+
+def get_failed_count() -> int:
+    """How many links are in the retry queue."""
+    _, log = _require()
+    import_legacy_failures()
+    return len(log.read_failures())

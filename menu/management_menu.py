@@ -1,7 +1,6 @@
 import questionary
-from downloader.retry_manager import retry_failed
+from managers.retry_manager import retry_failed
 from managers.file_manager import detect_duplicates, organize_files
-from downloader.metadata import embed_metadata
 
 def management_menu(config):
     """
@@ -27,5 +26,3 @@ def management_menu(config):
     elif choice == "Organize files by artist/album":
         organize_files(config["output_dir"])
 
-    elif choice == "Embed metadata in MP3s":
-        embed_metadata(config["output_dir"])
