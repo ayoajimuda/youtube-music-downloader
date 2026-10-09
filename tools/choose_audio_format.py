@@ -1,32 +1,28 @@
-import json
+"""Choose the audio format, with the active one listed first."""
+
 import questionary
-from constants import VALID_AUDIO_EXTENSIONS
-from utils.logger import log_success, log_error
 
-def choose_audio_format(config):
-    """
-    Lets user choose audio format, showing the active one first.
-    """
-    try:
-        current_format = config.get("audio_format", "mp3")
-        formats = list(VALID_AUDIO_EXTENSIONS)
-        formats_display = [f"{fmt} {'(active)' if fmt.strip('.') == current_format else ''}" for fmt in formats]
+from managers import config_manager, log_manager
+from menu.colorful_menu import Enhanced_Menu
 
-        choice = questionary.select(
-            "Select audio format:",
-            choices=formats_display
-        ).ask()
 
-        if not choice:
-            return
+def choose_audio_format(downloader=None):
+    """Let the user pick an audio format. Saves it, and applies it to the downloader if given."""
+    current = config_manager.load()["audio_format"]
+    formats = [current] + [f for f in config_manager.VALID_FORMATS if f != current]
+    choices = [questionary.Choice(f"{fmt} (active)" if fmt == current else fmt, value=fmt)
+               for fmt in formats]
 
-        new_format = choice.split()[0].strip(".")
-        config["audio_format"] = new_format
+    new_format = questionary.select("Select audio format:", choices=choices).ask()
+    if not new_format or new_format == current:        # None = Ctrl-C
+        return None
 
-        with open("config.json", "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-
-        log_success(f"Audio format updated to: {new_format}")
-
-    except Exception as e:
-        log_error(f"Failed to update audio format: {e}")
+    ok, message = config_manager.update_config("audio_format", new_format)
+    if not ok:
+        Enhanced_Menu.print_status(f"Failed to update audio format: {message}", "error")
+        return None
+    if downloader is not None:
+        downloader.audio_format = new_format
+    log_manager.log_info(f"Audio format changed: {current} -> {new_format}", console=False)
+    Enhanced_Menu.print_status(f"Audio format updated to: {new_format}", "success")
+    return new_format
