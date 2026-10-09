@@ -95,7 +95,6 @@ def _items(downloader):
         ("Help and troubleshooting", show_help),
     ]
 
-
 def tools_menu(downloader=None) -> None:
     """Show the tools menu until the user picks Back (or presses Ctrl-C)."""
     items = _items(downloader)
@@ -116,7 +115,6 @@ def tools_menu(downloader=None) -> None:
             Enhanced_Menu.print_status(f"{label} failed: {type(error).__name__}: {error}",
                                        "error")
             log_manager.log_error(f"Tools menu: {label} failed: {error}", console=False)
-
 
 def run(downloader=None) -> None:
     """Entry point for main_menu."""

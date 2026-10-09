@@ -4,14 +4,13 @@ Module-level: call configure() once at startup (main_menu.build_downloader does)
 then run() whenever the user picks "retry failed downloads".
 
 How a run works:
-  - Links are tried most-promising first: ones that failed to throttling, then
-    the ones with the fewest failed runs, oldest first.
+  - Links are tried most-promising first: the fewest failed runs, oldest first.
   - Each link gets up to `max_retries` attempts (from Settings), waiting
     `retry_delay`, then twice that, and so on between them. A throttled link,
     a bot check or a permanent error ("Video is private") stops early, since
     trying again straight away won't help.
-  - Links that keep failing are skipped after `give_up_after` failed runs, and
-    permanent errors are skipped altogether (both can be forced with flags).
+  - Links that keep failing are skipped after `give_up_after` failed runs
+    (include_exhausted=True retries them anyway).
   - Three throttled links in a row, or a bot check, ends the run; the rest stay
     queued. Successes leave the queue, and are marked done in the batch file
     they came from.
@@ -33,8 +32,8 @@ from colorama import Fore, Style, init
 
 init(autoreset=True)
 
-# Failures another attempt won't fix. Matched against the stored last_error,
-# which carries the downloader's classification (e.g. "- Video is private").
+# Failures another attempt won't fix. Matched against the error from this run's
+# attempt, so a private or removed video isn't tried over and over.
 PERMANENT_MARKERS = (
     "video is private", "private video", "members-only", "members only",
     "copyright", "video unavailable", "has been removed",
@@ -179,12 +178,7 @@ def import_legacy_failures(path=None) -> int:
             records[url] = {
                 "url": url,
                 "title": f"{artist} - {track}" if artist else track,
-                "source": "", "item_type": "track",
-                "attempt_count": attempts, "throttled_attempts": 0, "throttled": False,
-                "first_failed": old.get("first_failed", ""),
-                "last_failed": old.get("last_failed", ""),
-                "last_error": str(old.get("last_error") or "")[:300],
-                "metadata": {"artist": artist, "title": track} if artist else {"title": track},
+                "item_type": "track", "source": "", "attempt_count": attempts,
             }
             added += 1
         if added:
@@ -197,15 +191,17 @@ def import_legacy_failures(path=None) -> int:
 
 # ==================== Selection ====================
 def real_attempts(entry: dict) -> int:
-    """Failed runs that weren't caused by throttling."""
-    total = int(entry.get("attempt_count", entry.get("attempts", 0)) or 0)
-    throttled = int(entry.get("throttled_attempts", 0) or 0)
-    return max(0, total - throttled)
+    """Failed runs on record (throttled failures aren't counted when stored)."""
+    return int(entry.get("attempt_count", 0) or 0)
 
 
 def is_permanent(entry: dict) -> bool:
-    """True if the last error was one another attempt won't fix."""
-    return _contains(entry.get("last_error", ""), PERMANENT_MARKERS)
+    """
+    No error is stored any more, so nothing is known to be permanent before
+    trying. A permanent error still ends that link's attempts straight away,
+    and the link is skipped once it has failed give_up_after times.
+    """
+    return False
 
 
 def pending(include_permanent: bool = False,
@@ -221,8 +217,7 @@ def pending(include_permanent: bool = False,
             exhausted.append(entry)
         else:
             queue.append(entry)
-    queue.sort(key=lambda e: (not e.get("throttled"), real_attempts(e),
-                              e.get("last_failed", "")))
+    queue.sort(key=real_attempts)        # stable: equal counts stay oldest first
     return queue, permanent, exhausted
 
 
@@ -358,21 +353,16 @@ def _print_plan(queue, permanent, exhausted) -> None:
           f"{Style.DIM}(up to {attempts} attempt{'s' if attempts != 1 else ''} each"
           f"{f', {delay:.0f}s apart and doubling' if attempts > 1 and delay else ''})"
           f"{Style.RESET_ALL}")
-    throttled = sum(1 for e in queue if e.get("throttled"))
-    if throttled:
-        print(f"    {Fore.YELLOW}{throttled} last failed to throttling "
-              f"(likely to work now){Style.RESET_ALL}")
     if permanent:
         print(f"  {Fore.RED}Skipped, permanent error:{Style.RESET_ALL} {len(permanent)}")
     if exhausted:
         print(f"  {Fore.RED}Skipped, failed {_state['give_up_after']}+ times:"
               f"{Style.RESET_ALL} {len(exhausted)}")
     for entry in queue[:10]:
-        tag = f"{Fore.YELLOW} [throttled]{Style.RESET_ALL}" if entry.get("throttled") else ""
         search = f"{Style.DIM} [search]{Style.RESET_ALL}" if \
             entry["url"].startswith(SEARCH_PREFIX) else ""
         print(f"      - {_name(entry)[:55]} "
-              f"{Style.DIM}(failed {real_attempts(entry)}x){Style.RESET_ALL}{tag}{search}")
+              f"{Style.DIM}(failed {real_attempts(entry)}x){Style.RESET_ALL}{search}")
     if len(queue) > 10:
         print(f"      ...and {len(queue) - 10} more")
     print()
@@ -397,7 +387,7 @@ def run(include_permanent: bool = False, include_exhausted: bool = False,
     """
     Retry every eligible link in failed_downloads.json, one at a time.
 
-    include_permanent  also retry private/removed/copyright failures
+    include_permanent  kept for older callers; no effect (no errors are stored)
     include_exhausted  also retry links that have failed give_up_after times
     limit              retry at most this many links this run
     dry_run            print the plan, download nothing
@@ -450,14 +440,12 @@ def _run(log, include_permanent, include_exhausted, limit, dry_run, confirm) -> 
                 if entry.get("source"):
                     per_source.setdefault(entry["source"], {})[url] = "success"
                 log.log_success(f"Recovered on retry: {_name(entry)}", url=url,
-                                metadata=entry.get("metadata"),
                                 item_type=item_type, console=False)
                 print(f"      {Fore.GREEN}done{Style.RESET_ALL}")
             else:
                 summary.still_failing.append(url)
                 log.record_failure(url, title, error, entry.get("source", ""),
-                                   throttled=throttled, item_type=item_type,
-                                   metadata=entry.get("metadata"))
+                                   throttled=throttled, item_type=item_type)
                 if _contains(error, BOT_CHECK_MARKERS):
                     summary.stopped_reason = "bot_check"
                     print(f"      {Fore.RED}bot check{Style.RESET_ALL}")

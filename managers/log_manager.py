@@ -240,20 +240,33 @@ def read_text_log(kind: str = "error", limit: int = 25) -> List[str]:
     return [line for line in lines if line.strip()][-limit:]
 
 # ==================== Failed downloads (kept for retries) ====================
+# What a failed_downloads.json entry holds, and nothing else.
+FAILURE_FIELDS = ("url", "title", "item_type", "source", "attempt_count")
+
+
+def _slim(entry: dict) -> dict:
+    """Keep only FAILURE_FIELDS (older, longer entries are trimmed on the next save)."""
+    return {
+        "url": str(entry.get("url", "")),
+        "title": str(entry.get("title") or ""),
+        "item_type": str(entry.get("item_type") or "track"),
+        "source": str(entry.get("source") or ""),
+        "attempt_count": int(entry.get("attempt_count", entry.get("attempts", 0)) or 0),
+    }
+
+
 def read_failures() -> Dict[str, dict]:
-    """Every failed link on record, as {url: entry}. Never raises."""
-    data = _read_json(FAILED_FILE, {})
-    items = data.get("items") if isinstance(data, dict) else data
+    """Every failed link on record, as {url: entry}, oldest first. Never raises."""
+    data = _read_json(FAILED_FILE, [])
+    items = data.get("items") if isinstance(data, dict) else data     # dict = older format
     if not isinstance(items, list):
         return {}
-    return {e["url"]: e for e in items if isinstance(e, dict) and e.get("url")}
+    return {e["url"]: _slim(e) for e in items if isinstance(e, dict) and e.get("url")}
+
 
 def _write_failures(records: Dict[str, dict]) -> bool:
-    return _write_json(FAILED_FILE, {
-        "updated": datetime.now().isoformat(timespec="seconds"),
-        "count": len(records),
-        "items": sorted(records.values(), key=lambda e: e.get("last_failed", "")),
-    })
+    return _write_json(FAILED_FILE, [_slim(e) for e in records.values()])
+
 
 def record_failure(url: str, title: str = "", error: str = "", source: str = "",
                    throttled: bool = False, item_type: str = "track",
@@ -263,42 +276,29 @@ def record_failure(url: str, title: str = "", error: str = "", source: str = "",
     Put a failed link on record, or bump the one already there, and count it
     towards the end-of-run summary.
 
-    attempt_count accumulates across runs. `throttled` notes that the host was
-    refusing traffic rather than the link being bad: a throttled link will very
-    likely work later, a dead one never will. Throttled attempts are counted
-    separately so a link isn't written off after attempts that were never
-    really about it. Metadata is merged rather than replaced, so a later
-    attempt that knows less doesn't erase what an earlier one found.
+    Only url, title, item_type, source and attempt_count are stored. The error
+    itself goes to error.log. A throttled failure (YouTube refusing traffic,
+    not a bad link) is queued but doesn't add to attempt_count, so a link
+    isn't given up on because of attempts that were never really about it.
 
     kind: 'not_found', 'rate_limited' or 'download_error'.
     """
-    now = datetime.now().isoformat(timespec="seconds")
-    meta = clean_metadata(metadata)
+    meta = metadata or {}
     with _lock:
         records = read_failures()
-        entry = records.get(url, {
-            "url": url, "title": title, "source": source, "item_type": item_type,
-            "attempt_count": 0, "throttled_attempts": 0, "first_failed": now,
-            "metadata": {},
-        })
+        entry = records.get(url) or {"url": url, "attempt_count": 0}
         entry["title"] = title or meta.get("title") or entry.get("title", "")
+        entry["item_type"] = item_type or entry.get("item_type") or "track"
         entry["source"] = source or entry.get("source", "")
-        entry["item_type"] = item_type or entry.get("item_type", "track")
-        entry["attempt_count"] = int(entry.get("attempt_count", 0)) + 1
-        if throttled:
-            entry["throttled_attempts"] = int(entry.get("throttled_attempts", 0)) + 1
-        entry["throttled"] = bool(throttled)
-        entry["last_failed"] = now
-        entry["last_error"] = (error or "")[:300]
-        if meta:
-            entry["metadata"] = {**entry.get("metadata", {}), **meta}
-        records[url] = entry
+        if not throttled:
+            entry["attempt_count"] = int(entry.get("attempt_count", 0)) + 1
+        records[url] = _slim(entry)
         _write_failures(records)
 
         session_failed_urls.add(url)
         counted = "rate_limited" if throttled else kind
         session_failure_counts[counted] = session_failure_counts.get(counted, 0) + 1
-    return entry
+    return records[url]
 
 def clear_failures(urls) -> int:
     """Drop links from the failed-downloads record. Returns how many were removed."""
