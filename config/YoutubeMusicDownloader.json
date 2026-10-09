@@ -1,0 +1,19 @@
+{
+  "audio_format": "mp3",
+  "audio_quality": "320k",
+  "output_directory": "C:\\Users\\Ayomide\\Music\\Collection\\YouTube",
+  "ffmpeg_path": "",
+  "ytdlp_path": "",
+  "max_retries": 3,
+  "retry_delay": 10,
+  "download_timeout": 120,
+  "max_concurrent": 2,
+  "yt_dlp_sleep_min": 3,
+  "yt_dlp_sleep_max": 7,
+  "use_cookies": false,
+  "tracks_file": "data/tracks.json",
+  "playlists_file": "data/playlists.json",
+  "sync_write_tracks_json": true,
+  "auto_sync_enabled": false,
+  "auto_sync_interval": 3600
+}

@@ -1,20 +1,19 @@
-"""Logging manager for the downloader"""
-
 from pathlib import Path
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import List, Dict, Optional, Callable, Set
+from typing import List, Dict, Optional
 import json
 import os
 from colorama import init, Fore, Style
 import threading
-import re
-
 
 init(autoreset=True)
 
-BASE_DIR = Path(__file__).resolve().parent
+from managers.config_manager import APP_DIR
+
+# Same place as the config: the project root, or the user data folder when packaged.
+BASE_DIR = APP_DIR
 LOG_DIR = BASE_DIR / "logs"
 HISTORY_DIR = BASE_DIR / "history"
 HISTORY_LOG = HISTORY_DIR / "download_history.log"
@@ -30,7 +29,7 @@ DOWNLOAD_LOGS = {
 TEXT_LOGS = {
     "error": LOG_DIR / "error.log",       # errors during downloading
     "warning": LOG_DIR / "warning.log",   # warnings
-    "info": LOG_DIR / "info.log",
+    "info": LOG_DIR / "info.log",         # progress notes: saved, resumed, cleaned up
 }
 
 TEXT_LEVELS = {
@@ -86,11 +85,10 @@ def setup(force: bool = False) -> None:
         # Only the text logs need the logging module. The JSON logs are
         # written as records, not lines.
         error_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        levels = {"error": logging.ERROR, "warning": logging.WARNING}
 
         for kind, path in TEXT_LOGS.items():
             logger = logging.getLogger(f"downloader.{kind}")
-            logger.setLevel(levels[kind])
+            logger.setLevel(TEXT_LEVELS[kind])
             logger.propagate = False
             if not logger.handlers:          # adding twice would double every line
                 handler = RotatingFileHandler(path, maxBytes=MAX_BYTES,
@@ -302,6 +300,67 @@ def record_failure(url: str, title: str = "", error: str = "", source: str = "",
         session_failure_counts[counted] = session_failure_counts.get(counted, 0) + 1
     return entry
 
+def clear_failures(urls) -> int:
+    """Drop links from the failed-downloads record. Returns how many were removed."""
+    urls = set(urls)
+    if not urls:
+        return 0
+    with _lock:
+        records = read_failures()
+        removed = [u for u in urls if records.pop(u, None) is not None]
+        if removed:
+            _write_failures(records)
+    return len(removed)
+
+def reset_session() -> None:
+    """Forget this session's failure counts (call at the start of each run)."""
+    with _lock:
+        session_failed_urls.clear()
+        for key in session_failure_counts:
+            session_failure_counts[key] = 0
+
+# ==================== Clearing ====================
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+def clear_log(kind: str) -> bool:
+    """
+    Empty one log: 'success', 'failed', 'error', 'warning', 'info', 'history'
+    or 'retry_queue'. Old rotated copies of it are deleted too.
+
+    Text logs are truncated in place rather than deleted, because their
+    handler keeps the file open (and Windows won't delete an open file).
+    """
+    setup()
+    with _lock:
+        try:
+            if kind in DOWNLOAD_LOGS:
+                path = DOWNLOAD_LOGS[kind]
+                _unlink_quietly(path.with_name(path.stem + ".1.json"))
+                return _write_json(path, [])
+            if kind in TEXT_LOGS:
+                path = TEXT_LOGS[kind]
+                for handler in _loggers[kind].handlers:
+                    handler.flush()
+                with open(path, "w", encoding="utf-8"):
+                    pass
+                for number in range(1, BACKUP_COUNT + 1):
+                    _unlink_quietly(path.with_name(f"{path.name}.{number}"))
+                return True
+            if kind == "history":
+                with open(HISTORY_LOG, "w", encoding="utf-8"):
+                    pass
+                return True
+            if kind == "retry_queue":
+                return _write_failures({})
+        except OSError as error:
+            print(f"{Fore.RED}Could not clear {kind}: {error}{Style.RESET_ALL}")
+            return False
+    raise ValueError(f"Unknown log: {kind}")
+
 # ================= History Logger ========================
 def add_input(url: str, item_type: str, metadata: Optional[dict] = None) -> None:
     """Record the URL or search term the user gave, and what it turned out to be.
@@ -348,35 +407,3 @@ def get_history(limit: Optional[int] = None) -> List[Dict]:
     if limit:
         entries = entries[-limit:]
     return list(reversed(entries))
-
-# ======================== Archive ===================================
-
-@staticmethod
-def safe_name(name, fallback: str = "Playlist") -> str:
-    """Turn an arbitrary title into a filesystem-safe folder name."""
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip(" .")
-    return cleaned[:120] or fallback
-
-
-def load_archive(self, archive_path: Path) -> Set[str]:
-    """Return the set of video IDs already recorded in a yt-dlp archive file."""
-    ids: Set[str] = set()
-    try:
-        if Path(archive_path).exists():
-            with open(archive_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        ids.add(parts[-1])
-    except OSError as e:
-        self._on_error(f"Could not read archive {archive_path}: {e}")
-    return ids
-
-def append_archive(self, archive_path: Path, video_id: str, lock: threading.Lock):
-    """Append a finished video ID to the archive, serialised across threads."""
-    with lock:
-        try:
-            with open(archive_path, "a", encoding="utf-8") as f:
-                f.write(f"youtube {video_id}\n")
-        except OSError as e:
-            self._on_error(f"Could not update archive {archive_path}: {e}")
