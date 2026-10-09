@@ -15,6 +15,7 @@ import questionary
 
 from managers import config_manager, cookie_manager, log_manager
 from menu.colorful_menu import Enhanced_Menu
+from utils.track_checker import check_downloaded_files
 
 BACK = "Back"
 LOSSLESS = ("flac", "wav")
@@ -130,6 +131,8 @@ def _choices(downloader) -> List[Tuple[str, Callable[[], None]]]:
     queued = len(log_manager.read_failures())
     retry = f"Retry failed downloads ({queued} waiting)" if queued else "Retry failed downloads"
     items.append((retry, downloader.download_from_retry_queue))
+    items.append(("Check downloaded files (broken files, leftovers)",
+                  lambda: check_downloaded_files(downloader)))
 
     def settings():
         from menu import config_menu
