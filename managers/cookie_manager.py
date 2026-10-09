@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from colorama import Fore, Style, init
 
-from EnhancedMenu import Enhanced_Menu  # assumed existing
+from menu.colorful_menu import Enhanced_Menu # assumed existing
 
 try:
     import browser_cookie3
