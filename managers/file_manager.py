@@ -1,6 +1,6 @@
 import os
 import hashlib
-from log_manager import log_info, log_warning
+from managers.log_manager import log_info, log_warning
 
 def hash_file(filepath, blocksize=65536):
     hasher = hashlib.md5()
