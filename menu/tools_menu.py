@@ -84,10 +84,9 @@ def _items(downloader):
     from tools.cookie_check import cookie_checker
     from tools.dependency_check import dependency_check
     from tools.playlist_to_txt import playlist_to_txt
-    from tools.ytdlp_update_checker import ytdlp_update_checker
+    
     return [
         ("Check dependencies (yt-dlp, ffmpeg, ...)", dependency_check),
-        ("Check for yt-dlp updates", ytdlp_update_checker),
         ("Check cookies", cookie_checker),
         ("Convert a playlist to a .txt file", lambda: playlist_to_txt(downloader)),
         ("Choose audio format", lambda: choose_audio_format(downloader)),
