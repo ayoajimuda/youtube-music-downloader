@@ -38,7 +38,7 @@ def open_folder(path) -> None:
 
 
 def open_folders(downloader) -> None:
-    from tools.playlist_to_txt import default_folder
+    from tools.playlist_convert import default_folder
     folders = [
         ("Music folder", getattr(downloader, "output_directory", None)),
         ("Exported playlists", default_folder()),
@@ -84,11 +84,11 @@ def _items(downloader):
     from tools.choose_download_directory import choose_download_directory
     from tools.cookie_check import cookie_checker
     from tools.dependency_check import dependency_check
-    from tools.playlist_to_txt import playlist_to_txt
+    from tools.playlist_convert import playlist_convert
     return [
         ("Check dependencies (yt-dlp, ffmpeg, ...)", dependency_check),
         ("Check cookies", cookie_checker),
-        ("Export a playlist (JSON)", lambda: playlist_to_txt(downloader)),
+        ("Export a playlist (JSON, TXT or CSV)", lambda: playlist_convert(downloader)),
         ("Choose audio format", lambda: choose_audio_format(downloader)),
         ("Choose download folder", lambda: choose_download_directory(downloader)),
         ("Open a folder", lambda: open_folders(downloader)),
