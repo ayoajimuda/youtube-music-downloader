@@ -1,0 +1,243 @@
+name: Build & Release
+
+# HARMONI is a terminal app (main.py), so every build is a console program.
+# yt-dlp and ffmpeg ship in a bin/ folder NEXT TO the program rather than inside
+# it: tools/dependency_check.find_program() looks there, and the user can update
+# yt-dlp in place ("bin/yt-dlp -U") when YouTube changes something, without
+# waiting for a new HARMONI release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHON_VERSION: '3.13'
+  # Every package of the project, so imports made inside functions are never missed.
+  COLLECT: >-
+    --collect-submodules downloader
+    --collect-submodules managers
+    --collect-submodules menu
+    --collect-submodules tools
+    --collect-submodules utils
+
+jobs:
+  # ─────────────────────────────────────────
+  # Windows
+  # ─────────────────────────────────────────
+  build-windows:
+    name: Build – Windows
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download FFmpeg (Windows)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $exe = Get-ChildItem -Recurse ffmpeg_tmp -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $exe.FullName bin\ffmpeg.exe
+          $probe = Get-ChildItem -Recurse ffmpeg_tmp -Filter ffprobe.exe | Select-Object -First 1
+          Copy-Item $probe.FullName bin\ffprobe.exe
+          Remove-Item ffmpeg.zip, ffmpeg_tmp -Recurse -Force
+
+      - name: Download yt-dlp (Windows)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile bin\yt-dlp.exe
+
+      - name: Check the bundled programs run
+        shell: pwsh
+        run: |
+          bin\yt-dlp.exe --version
+          bin\ffmpeg.exe -version | Select-Object -First 1
+          bin\ffprobe.exe -version | Select-Object -First 1
+
+      - name: Build with PyInstaller (Windows)
+        shell: pwsh
+        run: |
+          $icon = @()
+          if (Test-Path "assets\harmoni.ico") { $icon = @("--icon", "assets\harmoni.ico") }
+          pyinstaller --name "Harmoni" --console --onefile --noconfirm `
+            $env:COLLECT.Split(" ") @icon main.py
+
+      - name: Package as ZIP (Windows)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path Harmoni | Out-Null
+          Copy-Item dist\Harmoni.exe Harmoni\
+          Copy-Item bin Harmoni\bin -Recurse
+          Compress-Archive -Path Harmoni -DestinationPath Harmoni-Windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Harmoni-Windows
+          path: Harmoni-Windows.zip
+
+  # ─────────────────────────────────────────
+  # macOS (Apple Silicon)
+  # ─────────────────────────────────────────
+  build-macos:
+    name: Build – macOS
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # FFmpeg is NOT bundled on macOS: Homebrew's ffmpeg depends on dozens of
+      # Homebrew libraries, so a copied binary won't start on a Mac without them.
+      # The dependency check tells the user to run "brew install ffmpeg".
+      - name: Download yt-dlp (macOS)
+        run: |
+          mkdir -p bin
+          curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos -o bin/yt-dlp
+          chmod +x bin/yt-dlp
+          bin/yt-dlp --version
+
+      - name: Build with PyInstaller (macOS)
+        run: |
+          pyinstaller --name "Harmoni" --console --onefile --noconfirm \
+            $COLLECT main.py
+
+      - name: Detect architecture
+        id: arch
+        run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+
+      - name: Package as tar.gz (macOS)
+        run: |
+          mkdir -p Harmoni
+          cp dist/Harmoni Harmoni/
+          cp -R bin Harmoni/bin
+          chmod +x Harmoni/Harmoni Harmoni/bin/*
+          tar -czf "Harmoni-macOS-${{ steps.arch.outputs.arch }}.tar.gz" Harmoni
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Harmoni-macOS-${{ steps.arch.outputs.arch }}
+          path: Harmoni-macOS-${{ steps.arch.outputs.arch }}.tar.gz
+
+  # ─────────────────────────────────────────
+  # Linux
+  # ─────────────────────────────────────────
+  build-linux:
+    name: Build – Linux
+    # The oldest supported Ubuntu: a PyInstaller build only runs on systems
+    # with the same or a newer glibc, so building on an old one reaches more distros.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # A static build, so it runs on any distro (apt's ffmpeg needs its libraries).
+      - name: Download FFmpeg (Linux)
+        run: |
+          mkdir -p bin ffmpeg_tmp
+          curl -fL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o ffmpeg.tar.xz
+          tar -xJf ffmpeg.tar.xz -C ffmpeg_tmp
+          cp "$(find ffmpeg_tmp -type f -name ffmpeg  | head -n 1)" bin/ffmpeg
+          cp "$(find ffmpeg_tmp -type f -name ffprobe | head -n 1)" bin/ffprobe
+          rm -rf ffmpeg.tar.xz ffmpeg_tmp
+
+      - name: Download yt-dlp (Linux)
+        run: |
+          curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o bin/yt-dlp
+          chmod +x bin/*
+
+      - name: Check the bundled programs run
+        run: |
+          bin/yt-dlp --version
+          bin/ffmpeg -version | head -n 1
+          bin/ffprobe -version | head -n 1
+
+      - name: Build with PyInstaller (Linux)
+        run: |
+          pyinstaller --name "Harmoni" --console --onefile --noconfirm --strip \
+            $COLLECT main.py
+
+      - name: Package as tar.gz (Linux)
+        run: |
+          mkdir -p Harmoni
+          cp dist/Harmoni Harmoni/
+          cp -R bin Harmoni/bin
+          chmod +x Harmoni/Harmoni Harmoni/bin/*
+          tar -czf Harmoni-Linux.tar.gz Harmoni
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Harmoni-Linux
+          path: Harmoni-Linux.tar.gz
+
+  # ─────────────────────────────────────────
+  # GitHub Release  (only on version tags)
+  # ─────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-macos, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List downloaded files
+        run: find artifacts -type f
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Harmoni ${{ github.ref_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/Harmoni-Windows/Harmoni-Windows.zip
+            artifacts/Harmoni-macOS-*/Harmoni-macOS-*.tar.gz
+            artifacts/Harmoni-Linux/Harmoni-Linux.tar.gz
