@@ -1,4 +1,4 @@
-"""HARMONI Music Downloader - start here:
+"""YoutubeMusic Music Downloader - start here:
 
     python main.py
 

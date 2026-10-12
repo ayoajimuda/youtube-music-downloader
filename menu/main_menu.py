@@ -5,7 +5,7 @@ def main_menu():
     Displays the main menu and returns the user's choice.
     """
     return questionary.select(
-        "🎵 Welcome to HARMONI Music Downloader — Select an option:",
+        "🎵 Welcome to YouTubeMusic Music Downloader — Select an option:",
         choices=[
             "Downloads Menu",
             "Management Menu",
