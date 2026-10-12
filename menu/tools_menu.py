@@ -42,8 +42,9 @@ def open_folders(downloader) -> None:
     folders = [
         ("Music folder", getattr(downloader, "output_directory", None)),
         ("Exported playlists", default_folder()),
+        ("Data (retry queue)", log_manager.DATA_DIR),
         ("Logs", log_manager.LOG_DIR),
-        ("History and retry queue", log_manager.HISTORY_DIR),
+        ("Download history", log_manager.HISTORY_DIR),
         ("Cookies", cookie_manager.COOKIE_DIRECTORY),
     ]
     choices = [questionary.Choice(f"{label}  ({Path(path).resolve()})", value=Path(path))
@@ -84,16 +85,16 @@ def _items(downloader):
     from tools.cookie_check import cookie_checker
     from tools.dependency_check import dependency_check
     from tools.playlist_to_txt import playlist_to_txt
-    
     return [
         ("Check dependencies (yt-dlp, ffmpeg, ...)", dependency_check),
         ("Check cookies", cookie_checker),
-        ("Convert a playlist to a .txt file", lambda: playlist_to_txt(downloader)),
+        ("Export a playlist (JSON)", lambda: playlist_to_txt(downloader)),
         ("Choose audio format", lambda: choose_audio_format(downloader)),
         ("Choose download folder", lambda: choose_download_directory(downloader)),
         ("Open a folder", lambda: open_folders(downloader)),
         ("Help and troubleshooting", show_help),
     ]
+
 
 def tools_menu(downloader=None) -> None:
     """Show the tools menu until the user picks Back (or presses Ctrl-C)."""
@@ -115,6 +116,7 @@ def tools_menu(downloader=None) -> None:
             Enhanced_Menu.print_status(f"{label} failed: {type(error).__name__}: {error}",
                                        "error")
             log_manager.log_error(f"Tools menu: {label} failed: {error}", console=False)
+
 
 def run(downloader=None) -> None:
     """Entry point for main_menu."""

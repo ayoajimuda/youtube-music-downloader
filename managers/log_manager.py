@@ -10,14 +10,15 @@ import threading
 
 init(autoreset=True)
 
-from managers.config_manager import APP_DIR
+from managers.config_manager import APP_DIR, DATA_DIR
 
 # Same place as the config: the project root, or the user data folder when packaged.
 BASE_DIR = APP_DIR
 LOG_DIR = BASE_DIR / "logs"
 HISTORY_DIR = BASE_DIR / "history"
 HISTORY_LOG = HISTORY_DIR / "download_history.log"
-FAILED_FILE = HISTORY_DIR / "failed_downloads.json"
+FAILED_FILE = DATA_DIR / "failed_downloads.json"     # the retry queue
+_OLD_FAILED_FILE = HISTORY_DIR / "failed_downloads.json"
 
 # Downloads are data, so they go in JSON with the track's metadata alongside.
 DOWNLOAD_LOGS = {
@@ -80,7 +81,15 @@ def setup(force: bool = False) -> None:
 
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_LOG.touch(exist_ok=True)
+
+        # The retry queue used to live in history/; bring it over once.
+        if _OLD_FAILED_FILE.is_file() and not FAILED_FILE.exists():
+            try:
+                _OLD_FAILED_FILE.replace(FAILED_FILE)
+            except OSError:
+                pass
 
         # Only the text logs need the logging module. The JSON logs are
         # written as records, not lines.

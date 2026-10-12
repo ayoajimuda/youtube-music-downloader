@@ -30,24 +30,26 @@ def get_app_dir() -> Path:
     """
     Where the program keeps its config, logs and history.
 
-      YouTubeMusicDownloader_HOME set      -> that folder (the macOS launcher sets it)
-      packaged app on macOS -> ~/Library/Application Support/YoutubeMusic
+      HARMONI_HOME set      -> that folder (the macOS launcher sets it)
+      packaged app on macOS -> ~/Library/Application Support/HARMONI
       packaged app elsewhere-> the folder the program is in
       run as a script       -> the project root
     """
-    home = os.environ.get("YOUTUBEMUSICDOWNLOADER_HOME")
+    home = os.environ.get("HARMONI_HOME")
     if home:
         return Path(home).expanduser().resolve()
     if getattr(sys, "frozen", False):
         if sys.platform == "darwin":
             # An installed app's own folder isn't the place for user data.
-            return Path.home() / "Library" / "Application Support" / "YouTubeMusicDownloader"
+            return Path.home() / "Library" / "Application Support" / "HARMONI"
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent       # managers/ -> project root
 
 
 APP_DIR = get_app_dir()
 CONFIG_PATH = APP_DIR / "config" / "YoutubeMusicDownloader.json"
+DATA_DIR = APP_DIR / "data"          # the retry queue, tracks/playlists lists
+EXPORT_DIR = APP_DIR / "export"      # exported playlists (JSON)
 
 # ==================== Schema ====================
 VALID_FORMATS = ("mp3", "flac", "ogg", "opus", "m4a", "wav")

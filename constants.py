@@ -39,6 +39,8 @@ CONFIG_FILE = config_manager.CONFIG_PATH
 FAILED_FILE = log_manager.FAILED_FILE                   # the retry queue
 LOG_DIR = log_manager.LOG_DIR
 HISTORY_DIR = log_manager.HISTORY_DIR
+DATA_DIR = config_manager.DATA_DIR
+EXPORT_DIR = config_manager.EXPORT_DIR
 
 
 def download_directory() -> Path:

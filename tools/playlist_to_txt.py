@@ -1,14 +1,9 @@
-"""Save a YouTube / YouTube Music playlist as a .txt batch file.
+"""Save a YouTube / YouTube Music playlist as a JSON file in the export folder.
 
-Each track becomes one line the batch downloader understands:
-
-    # Playlist: Road Trip
-    # Source: https://music.youtube.com/playlist?list=PL...
-    Daft Punk - One More Time | https://music.youtube.com/watch?v=FGBhQbmPwH8
-    # [Private video] | https://music.youtube.com/watch?v=xxxxxxxxxxx   (unavailable, skipped)
-
-Exporting again into the same file adds only the new tracks, so the
-"# status=success" marks the downloader writes are kept.
+The batch downloader reads this file directly ("every link in a file") and
+adds "status": "success" to each track it downloads. Unavailable tracks have
+no link, so they're never attempted. Exporting again into the same file adds
+only the new tracks, so those statuses are kept.
 
 Usage:
     from tools.playlist_to_txt import export_playlist, playlist_to_txt
@@ -48,10 +43,10 @@ class Track:
     url: str
     available: bool = True
 
-    def line(self) -> str:
-        name = f"{self.artist} - {self.title}" if self.artist else self.title
-        name = name.replace("|", "/").strip() or self.video_id
-        return f"{name} | {self.url}" if self.available else f"# {name} | {self.url}"
+    def record(self) -> dict:
+        if not self.available:                 # no link: the downloader won't try it
+            return {"title": self.title, "id": self.video_id}
+        return {"artist": self.artist, "title": self.title, "url": self.url}
 
 
 @dataclass
@@ -67,7 +62,7 @@ class PlaylistExport:
 
 # ==================== Reading the playlist ====================
 def default_folder() -> Path:
-    return config_manager.APP_DIR / "playlists"
+    return config_manager.EXPORT_DIR
 
 
 def safe_filename(name: str, fallback: str = "playlist") -> str:
@@ -154,28 +149,40 @@ def tracks_from(info: dict, source_url: str) -> List[Track]:
 
 
 # ==================== Writing the file ====================
-def _ids_in(path: Path) -> Set[str]:
-    """Video IDs already in a file (commented-out lines included)."""
+def _ids_in(data: dict) -> Set[str]:
+    """Video IDs already in an export (unavailable ones included)."""
+    ids = set()
+    for track in data.get("tracks") or []:
+        if isinstance(track, dict):
+            ids.update(VIDEO_ID.findall(str(track.get("url", ""))))
+    for track in data.get("unavailable") or []:
+        if isinstance(track, dict) and track.get("id"):
+            ids.add(str(track["id"]))
+    return ids
+
+
+def _read_export(path: Path) -> Optional[dict]:
+    """An existing export, or None if it's missing or isn't one of ours."""
     try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return set()
-    return set(VIDEO_ID.findall(text))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) and isinstance(data.get("tracks"), list) else None
 
 
-def _write_atomically(path: Path, text: str) -> None:
+def _write_atomically(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
 def export_playlist(url: str, output: Optional[Path] = None, merge: bool = True,
                     info: Optional[dict] = None) -> PlaylistExport:
     """
-    Write a playlist to a .txt batch file and return what was written.
+    Write a playlist to a JSON file and return what was written.
 
-    output  file to write; defaults to playlists/<playlist title>.txt
+    output  file to write; defaults to export/<playlist title>.json
     merge   if the file exists, add only tracks it doesn't have yet (keeps statuses);
             False replaces it
     info    playlist data already fetched with fetch_playlist(), to skip a second lookup
@@ -183,29 +190,39 @@ def export_playlist(url: str, output: Optional[Path] = None, merge: bool = True,
     info = info if info is not None else fetch_playlist(url)
     title = (info.get("title") or info.get("id") or "Playlist").strip()
     tracks = tracks_from(info, url)
-    path = Path(output) if output else default_folder() / f"{safe_filename(title)}.txt"
+    path = Path(output) if output else default_folder() / f"{safe_filename(title)}.json"
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     unavailable = sum(1 for t in tracks if not t.available)
 
-    if merge and path.is_file():
-        known = _ids_in(path)
+    existing = _read_export(path) if merge and path.is_file() else None
+    if merge and path.is_file() and existing is None:
+        raise PlaylistError(f"{path.name} isn't a playlist export, so new tracks can't be "
+                            "added to it. Replace it or save under another name.")
+    if existing is not None:
+        known = _ids_in(existing)
         new = [t for t in tracks if t.video_id not in known]
         if new:
-            existing = path.read_text(encoding="utf-8-sig", errors="replace").rstrip("\n")
-            lines = [existing, "", f"# Added {stamp}: {len(new)} new track(s)"]
-            lines += [t.line() for t in new]
-            _write_atomically(path, "\n".join(lines) + "\n")
+            existing["tracks"] += [t.record() for t in new if t.available]
+            gone = [t.record() for t in new if not t.available]
+            if gone:
+                existing["unavailable"] = (existing.get("unavailable") or []) + gone
+            existing["updated"] = stamp
+            existing["track_count"] = len(existing["tracks"])
+            _write_atomically(path, existing)
         return PlaylistExport(path, title, len(tracks), len(new),
                               sum(1 for t in new if not t.available),
                               len(tracks) - len(new), tracks)
 
-    header = [f"# Playlist: {title}",
-              f"# Source: {info.get('webpage_url') or url.strip()}",
-              f"# Exported: {stamp} - {len(tracks)} tracks"
-              + (f", {unavailable} unavailable (commented out)" if unavailable else ""),
-              "# Export again to add new tracks; existing lines and their status are kept.",
-              ""]
-    _write_atomically(path, "\n".join(header + [t.line() for t in tracks]) + "\n")
+    data = {
+        "playlist": title,
+        "source": info.get("webpage_url") or url.strip(),
+        "exported": stamp,
+        "updated": stamp,
+        "track_count": len(tracks) - unavailable,
+        "tracks": [t.record() for t in tracks if t.available],
+        "unavailable": [t.record() for t in tracks if not t.available],
+    }
+    _write_atomically(path, data)
     return PlaylistExport(path, title, len(tracks), len(tracks), unavailable, 0, tracks)
 
 
@@ -234,14 +251,14 @@ def playlist_to_txt(downloader=None) -> Optional[PlaylistExport]:
         Enhanced_Menu.print_status(str(error), "error")
         return None
     title = (info_preview.get("title") or "Playlist").strip()
-    suggested = default_folder() / f"{safe_filename(title)}.txt"
+    suggested = default_folder() / f"{safe_filename(title)}.json"
 
     answer = questionary.path("Save as:", default=str(suggested)).ask()
     if not answer:
         return None
     path = Path(answer.strip().strip('"').strip("'")).expanduser()
-    if path.suffix.lower() != ".txt":
-        path = path.with_suffix(".txt")
+    if path.suffix.lower() != ".json":
+        path = path.with_suffix(".json")
 
     merge = True
     if path.is_file():
@@ -252,7 +269,14 @@ def playlist_to_txt(downloader=None) -> Optional[PlaylistExport]:
             return None
         merge = choice.startswith("Add")
 
-    result = export_playlist(url, path, merge=merge, info=info_preview)
+    try:
+        result = export_playlist(url, path, merge=merge, info=info_preview)
+    except PlaylistError as error:
+        Enhanced_Menu.print_status(str(error), "error")
+        return None
+    except OSError as error:
+        Enhanced_Menu.print_status(f"Couldn't save {path}: {error}", "error")
+        return None
 
     Enhanced_Menu.print_status(f"Saved {result.path}", "success")
     Enhanced_Menu.print_key_value("Playlist", result.title, width=16)
@@ -262,7 +286,7 @@ def playlist_to_txt(downloader=None) -> Optional[PlaylistExport]:
     Enhanced_Menu.print_key_value("Added", result.added, width=16)
     if result.unavailable:
         Enhanced_Menu.print_key_value("Unavailable", result.unavailable, width=16,
-                                      note="private/deleted, commented out")
+                                      note="private/deleted, listed under \"unavailable\"")
 
     if downloader is not None and result.total and questionary.confirm(
             "Download this playlist now?", default=False).ask():
