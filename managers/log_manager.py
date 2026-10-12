@@ -116,6 +116,7 @@ def setup(force: bool = False) -> None:
             _console_logger.addHandler(console_handler)
 
         _set_up = True
+        _trim_failures()            # old long entries -> the short format
 
 # ==================== JSON helpers ====================
 def _read_json(path: Path, fallback):
@@ -275,6 +276,20 @@ def read_failures() -> Dict[str, dict]:
 
 def _write_failures(records: Dict[str, dict]) -> bool:
     return _write_json(FAILED_FILE, [_slim(e) for e in records.values()])
+
+
+def _trim_failures() -> None:
+    """
+    Rewrite failed_downloads.json in the short format if it still holds the
+    older, longer entries, so the file is tidy from the moment the program starts.
+    """
+    raw = _read_json(FAILED_FILE, None)
+    if raw is None:
+        return
+    if isinstance(raw, list) and all(isinstance(e, dict) and set(e) == set(FAILURE_FIELDS)
+                                     for e in raw):
+        return                                   # already short
+    _write_failures(read_failures())
 
 
 def record_failure(url: str, title: str = "", error: str = "", source: str = "",
