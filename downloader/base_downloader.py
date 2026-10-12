@@ -132,7 +132,7 @@ class YoutubeMusicDownloader:
         self.yt_dlp_sleep_min = 3     # min seconds yt-dlp waits between requests
         self.yt_dlp_sleep_max = 7     # max seconds (random delay in this range)
 
-        self.rate_limit_backoff = 300
+        self.rate_limit_backoff = 60
         self.rate_limit_max_wait = 1800
         self._last_run_throttled = False
 
