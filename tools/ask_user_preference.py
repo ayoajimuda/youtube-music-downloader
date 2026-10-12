@@ -165,9 +165,46 @@ def _ask_cookies(current: bool) -> bool:
     print("  YouTube's 'confirm you're not a bot' checks")
     use = _ask_yn("Use cookies for authentication?", current)
     if use and not cookie_file(True):
-        _status("No cookie file is loaded yet. Downloads will run without cookies until "
-                "you add one in the Cookie Manager.", "warning")
+        _ask_cookie_file()
     return use
+
+
+def _ask_cookie_file() -> Optional[Path]:
+    """
+    No cookie file yet: ask for one here instead of sending the user to the
+    Cookie Manager. The file becomes the active one and is remembered in the
+    config, so it's used again next time. Enter skips.
+    """
+    cookies = _state["cookies"]
+    loader = getattr(cookies, "load_cookies", None)
+    if loader is None:                        # no cookie manager connected
+        _status("No cookie file is loaded yet. Add one in the Cookie Manager.", "warning")
+        return None
+
+    print(f"  {Style.DIM}Export cookies.txt from a browser signed in to YouTube "
+          f"(see Cookies Menu -> manual export for how).{Style.RESET_ALL}")
+    while True:
+        answer = _ask("Path to your cookies.txt (Enter to skip)", None)
+        answer = answer.strip('"').strip("'")              # drag-and-drop adds quotes
+        if not answer:
+            _status("Skipped. Downloads will run without cookies until you add a cookie "
+                    "file (here, or in the Cookies Menu).", "warning")
+            return None
+        path = Path(os.path.expandvars(answer)).expanduser()
+        if path.is_dir():
+            _status(f"{path} is a folder. Give the cookies.txt file itself.", "error")
+            continue
+        loaded = loader(str(path))            # checks the format, makes it active
+        if not loaded:
+            continue                          # not found / not a cookie file: ask again
+        loaded = Path(loaded).resolve()
+        config, _ = _require()
+        try:
+            config.update(cookie_file=str(loaded))     # remembered for next start
+        except Exception:
+            pass
+        _status(f"Using cookies from {loaded}", "success")
+        return loaded
 
 
 # ==================== Cookies ====================
