@@ -30,18 +30,18 @@ def get_app_dir() -> Path:
     """
     Where the program keeps its config, logs and history.
 
-      HARMONI_HOME set      -> that folder (the macOS launcher sets it)
-      packaged app on macOS -> ~/Library/Application Support/HARMONI
-      packaged app elsewhere-> the folder the program is in
-      run as a script       -> the project root
+      YTMUSIC_DOWNLOADER_HOME set -> that folder
+      packaged app on macOS       -> ~/Library/Application Support/YouTube Music Downloader
+      packaged app elsewhere      -> the folder the program is in
+      run as a script             -> the project root
     """
-    home = os.environ.get("HARMONI_HOME")
+    home = os.environ.get("YTMUSIC_DOWNLOADER_HOME")
     if home:
         return Path(home).expanduser().resolve()
     if getattr(sys, "frozen", False):
         if sys.platform == "darwin":
             # An installed app's own folder isn't the place for user data.
-            return Path.home() / "Library" / "Application Support" / "HARMONI"
+            return Path.home() / "Library" / "Application Support" / "YouTube Music Downloader"
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent       # managers/ -> project root
 

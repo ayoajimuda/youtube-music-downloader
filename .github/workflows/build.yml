@@ -1,10 +1,10 @@
 name: Build & Release
 
-# HARMONI is a terminal app (main.py), so every build is a console program.
+# YouTube Music Downloader is a terminal app (main.py), so every build is a console program.
 # yt-dlp and ffmpeg ship in a bin/ folder NEXT TO the program rather than inside
 # it: tools/dependency_check.find_program() looks there, and the user can update
 # yt-dlp in place ("bin/yt-dlp -U") when YouTube changes something, without
-# waiting for a new HARMONI release.
+# waiting for a new release.
 
 on:
   push:
@@ -77,23 +77,23 @@ jobs:
         shell: pwsh
         run: |
           $icon = @()
-          if (Test-Path "assets\harmoni.ico") { $icon = @("--icon", "assets\harmoni.ico") }
-          pyinstaller --name "Harmoni" --console --onefile --noconfirm `
+          if (Test-Path "assets\youtube_music_downloader.ico") { $icon = @("--icon", "assets\youtube_music_downloader.ico") }
+          pyinstaller --name "YoutubeMusicDownloader" --console --onefile --noconfirm `
             $env:COLLECT.Split(" ") @icon main.py
 
       - name: Package as ZIP (Windows)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path Harmoni | Out-Null
-          Copy-Item dist\Harmoni.exe Harmoni\
-          Copy-Item bin Harmoni\bin -Recurse
-          Compress-Archive -Path Harmoni -DestinationPath Harmoni-Windows.zip
+          New-Item -ItemType Directory -Force -Path YoutubeMusicDownloader | Out-Null
+          Copy-Item dist\YoutubeMusicDownloader.exe YoutubeMusicDownloader\
+          Copy-Item bin YoutubeMusicDownloader\bin -Recurse
+          Compress-Archive -Path YoutubeMusicDownloader -DestinationPath YoutubeMusicDownloader-Windows.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Harmoni-Windows
-          path: Harmoni-Windows.zip
+          name: YoutubeMusicDownloader-Windows
+          path: YoutubeMusicDownloader-Windows.zip
 
   # ─────────────────────────────────────────
   # macOS (Apple Silicon)
@@ -128,7 +128,7 @@ jobs:
 
       - name: Build with PyInstaller (macOS)
         run: |
-          pyinstaller --name "Harmoni" --console --onefile --noconfirm \
+          pyinstaller --name "YoutubeMusicDownloader" --console --onefile --noconfirm \
             $COLLECT main.py
 
       - name: Detect architecture
@@ -137,17 +137,17 @@ jobs:
 
       - name: Package as tar.gz (macOS)
         run: |
-          mkdir -p Harmoni
-          cp dist/Harmoni Harmoni/
-          cp -R bin Harmoni/bin
-          chmod +x Harmoni/Harmoni Harmoni/bin/*
-          tar -czf "Harmoni-macOS-${{ steps.arch.outputs.arch }}.tar.gz" Harmoni
+          mkdir -p YoutubeMusicDownloader
+          cp dist/YoutubeMusicDownloader YoutubeMusicDownloader/
+          cp -R bin YoutubeMusicDownloader/bin
+          chmod +x YoutubeMusicDownloader/YoutubeMusicDownloader YoutubeMusicDownloader/bin/*
+          tar -czf "YoutubeMusicDownloader-macOS-${{ steps.arch.outputs.arch }}.tar.gz" YoutubeMusicDownloader
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Harmoni-macOS-${{ steps.arch.outputs.arch }}
-          path: Harmoni-macOS-${{ steps.arch.outputs.arch }}.tar.gz
+          name: YoutubeMusicDownloader-macOS-${{ steps.arch.outputs.arch }}
+          path: YoutubeMusicDownloader-macOS-${{ steps.arch.outputs.arch }}.tar.gz
 
   # ─────────────────────────────────────────
   # Linux
@@ -195,22 +195,22 @@ jobs:
 
       - name: Build with PyInstaller (Linux)
         run: |
-          pyinstaller --name "Harmoni" --console --onefile --noconfirm --strip \
+          pyinstaller --name "YoutubeMusicDownloader" --console --onefile --noconfirm --strip \
             $COLLECT main.py
 
       - name: Package as tar.gz (Linux)
         run: |
-          mkdir -p Harmoni
-          cp dist/Harmoni Harmoni/
-          cp -R bin Harmoni/bin
-          chmod +x Harmoni/Harmoni Harmoni/bin/*
-          tar -czf Harmoni-Linux.tar.gz Harmoni
+          mkdir -p YoutubeMusicDownloader
+          cp dist/YoutubeMusicDownloader YoutubeMusicDownloader/
+          cp -R bin YoutubeMusicDownloader/bin
+          chmod +x YoutubeMusicDownloader/YoutubeMusicDownloader YoutubeMusicDownloader/bin/*
+          tar -czf YoutubeMusicDownloader-Linux.tar.gz YoutubeMusicDownloader
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Harmoni-Linux
-          path: Harmoni-Linux.tar.gz
+          name: YoutubeMusicDownloader-Linux
+          path: YoutubeMusicDownloader-Linux.tar.gz
 
   # ─────────────────────────────────────────
   # GitHub Release  (only on version tags)
@@ -233,11 +233,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "Harmoni ${{ github.ref_name }}"
+          name: "YouTube Music Downloader ${{ github.ref_name }}"
           draft: false
           prerelease: false
           generate_release_notes: true
           files: |
-            artifacts/Harmoni-Windows/Harmoni-Windows.zip
-            artifacts/Harmoni-macOS-*/Harmoni-macOS-*.tar.gz
-            artifacts/Harmoni-Linux/Harmoni-Linux.tar.gz
+            artifacts/YoutubeMusicDownloader-Windows/YoutubeMusicDownloader-Windows.zip
+            artifacts/YoutubeMusicDownloader-macOS-*/YoutubeMusicDownloader-macOS-*.tar.gz
+            artifacts/YoutubeMusicDownloader-Linux/YoutubeMusicDownloader-Linux.tar.gz

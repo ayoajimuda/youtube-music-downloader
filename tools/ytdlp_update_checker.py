@@ -5,7 +5,7 @@ Checks if a newer version of yt-dlp is available and tells the user how to updat
 Usage:
     info = check_ytdlp_updates()
     notify_update_available(info)
-    check_on_startup()            # the same, silent unless there's an update
+    check_on_startup()            # one line: up to date, or the update notice
 """
 
 import json
@@ -170,9 +170,10 @@ def notify_update_available(update_info: dict) -> None:
 # ==================== Startup check ====================
 def check_on_startup() -> Optional[dict]:
     """
-    For program start: check once, and only print anything if there's an
-    update. Nothing is saved to disk; offline or slow networks are skipped
-    quietly (get_latest_version gives up after a few seconds).
+    For program start: one line saying yt-dlp is up to date, or the update
+    notice if it isn't. Nothing is saved to disk; offline or slow networks are
+    skipped quietly (get_latest_version gives up after a few seconds), and a
+    missing yt-dlp is already reported by the dependency check.
     """
     try:
         info = check_ytdlp_updates()
@@ -180,4 +181,6 @@ def check_on_startup() -> Optional[dict]:
         return None
     if info.get('update_available'):
         notify_update_available(info)
+    elif info.get('current_version') and info.get('latest_version'):
+        Enhanced_Menu.print_status(info['message'], "success")   # ✓ yt-dlp is up to date (...)
     return info

@@ -1,4 +1,4 @@
-"""YoutubeMusic Music Downloader - start here:
+"""YouTube Music Downloader - start here:
 
     python main.py
 
@@ -112,7 +112,6 @@ def startup_checks() -> None:
 def run(downloader) -> int:
     """The main-menu loop."""
     while True:
-        downloader_menu.status_block(downloader)
         choice = main_menu()
 
         try:
