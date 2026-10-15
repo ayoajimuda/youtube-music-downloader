@@ -1,7 +1,4 @@
-"""YouTube Music Downloader - the desktop window.
-
-    python gui_main.py
-
+"""
 The terminal program (python main.py) and this window are two front ends to
 the same project: they share the downloader, settings, cookies, logs, history
 and retry queue. This file sets the project up exactly as main.py does, then

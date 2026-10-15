@@ -1,6 +1,4 @@
 """
-yt-dlp update checker module.
-Checks if a newer version of yt-dlp is available and tells the user how to update it.
 
 Usage:
     info = check_ytdlp_updates()
